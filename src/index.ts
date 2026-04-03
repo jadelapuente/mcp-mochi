@@ -271,6 +271,8 @@ const CardSchema = z
       ),
     name: z.string().describe("Display name of the card"),
     "deck-id": z.string().describe("ID of the deck containing the card"),
+    "archived?": z.boolean().optional().nullable(),
+    "trashed?": z.object({ date: z.string() }).optional().nullable(),
     fields: z
       .record(z.string(), z.unknown())
       .optional()
@@ -285,7 +287,10 @@ const UpdateCardResponseSchema = CardSchema.strip();
 
 const ListCardsResponseSchema = z
   .object({
-    bookmark: z.string().describe("Pagination bookmark for fetching next page"),
+    bookmark: z.string()
+      .nullable()
+      .optional()
+      .describe("Pagination bookmark for fetching next page"),
     docs: z.array(CardSchema).describe("Array of cards"),
   })
   .strip();
@@ -433,7 +438,12 @@ export class MochiClient {
       ? toMochiListCardsParams(validatedParams)
       : undefined;
     const response = await this.api.get("/cards", { params: mochiParams });
-    return ListCardsResponseSchema.parse(response.data);
+    const parsed = ListCardsResponseSchema.parse(response.data);
+    
+    return {
+      bookmark: parsed.bookmark,
+      docs: parsed.docs.filter((card) => !card["archived?"] && !card["trashed?"]),
+    };
   }
 
   async listTemplates(
