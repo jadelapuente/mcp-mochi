@@ -367,6 +367,7 @@ export class MochiClient {
     this.token = token;
     this.api = axios.create({
       baseURL: "https://app.mochi.cards/api/",
+      timeout: 30000,
       headers: {
         Authorization: `Basic ${Buffer.from(`${this.token}:`).toString(
           "base64"
@@ -714,7 +715,7 @@ server.registerTool(
       }
 
       return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
       };
     } catch (error) {
@@ -754,7 +755,7 @@ server.registerTool(
       }
 
       return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
       };
     } catch (error) {
@@ -783,7 +784,7 @@ server.registerTool(
       const { cardId, ...updateArgs } = args;
       const response = await mochiClient.updateCard(cardId, updateArgs);
       return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
       };
     } catch (error) {
@@ -820,7 +821,7 @@ server.registerTool(
       await mochiClient.deleteCard(args.cardId);
       const response = { success: true, cardId: args.cardId };
       return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
       };
     } catch (error) {
@@ -850,7 +851,7 @@ server.registerTool(
         archived: args.archived,
       });
       return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
       };
     } catch (error) {
@@ -878,7 +879,7 @@ server.registerTool(
     try {
       const response = await mochiClient.listCards(args);
       return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
       };
     } catch (error) {
@@ -905,7 +906,7 @@ server.registerTool(
     try {
       const response = await mochiClient.listDecks(args);
       return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
       };
     } catch (error) {
@@ -933,7 +934,7 @@ server.registerTool(
     try {
       const response = await mochiClient.listTemplates(args);
       return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
       };
     } catch (error) {
@@ -961,7 +962,7 @@ server.registerTool(
     try {
       const response = await mochiClient.getTemplate(args.templateId);
       return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
       };
     } catch (error) {
@@ -989,7 +990,7 @@ server.registerTool(
     try {
       const response = await mochiClient.getDueCards(args);
       return {
-        content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+        content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
       };
     } catch (error) {
