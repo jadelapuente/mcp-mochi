@@ -320,7 +320,9 @@ type ListCardsResponse = z.infer<typeof ListCardsResponseSchema>;
 const BatchCreateResultSchema = z.object({
   created: z
     .array(CardSchema)
-    .describe("Successfully created cards, in input order"),
+    .describe(
+      "Successfully created cards. These cards exist on Mochi — do NOT retry creating them, even if attachmentErrors references them."
+    ),
   failed: z
     .array(
       z.object({
@@ -330,18 +332,48 @@ const BatchCreateResultSchema = z.object({
         error: z.string().describe("Error message for the failed card"),
       })
     )
-    .describe("Cards that failed to create"),
+    .describe("Cards that failed to create. Safe to retry."),
+  attachmentErrors: z
+    .array(
+      z.object({
+        index: z
+          .number()
+          .describe("Zero-based index in the input array"),
+        cardId: z
+          .string()
+          .describe("ID of the card that was created without its attachment"),
+        filename: z.string().describe("Attachment filename that failed to upload"),
+        error: z.string().describe("Error message for the failed attachment"),
+      })
+    )
+    .describe(
+      "Attachments that failed AFTER the card was already created. The card exists in `created` — retry only the attachment, do not recreate the card."
+    ),
 });
 type BatchCreateResult = z.infer<typeof BatchCreateResultSchema>;
 
+interface BatchAttemptResult {
+  card: CreateCardResponse;
+  attachmentErrors: { filename: string; error: string }[];
+}
+
 function collectBatchResults(
-  settled: PromiseSettledResult<CreateCardResponse>[]
+  settled: PromiseSettledResult<BatchAttemptResult>[]
 ): BatchCreateResult {
   const created: CreateCardResponse[] = [];
   const failed: { index: number; error: string }[] = [];
+  const attachmentErrors: BatchCreateResult["attachmentErrors"] = [];
   settled.forEach((r, i) => {
     if (r.status === "fulfilled") {
-      created.push(r.value);
+      created.push(r.value.card);
+      for (const ae of r.value.attachmentErrors) {
+        attachmentErrors.push({
+          index: i,
+          cardId: r.value.card.id,
+          filename: ae.filename,
+          error: ae.error,
+        });
+      }
     } else {
       const err = r.reason;
       failed.push({
@@ -350,7 +382,7 @@ function collectBatchResults(
       });
     }
   });
-  return { created, failed };
+  return { created, failed, attachmentErrors };
 }
 
 async function runWithConcurrency<T, R>(
@@ -634,12 +666,11 @@ export class MochiClient {
   async createCards(requests: CreateCardRequest[]): Promise<BatchCreateResult> {
     const settled = await runWithConcurrency(requests, 3, async (req) => {
       const card = await this.createCard(req);
-      if (req.attachments) {
-        for (const [filename, data] of Object.entries(req.attachments)) {
-          await this.addAttachment({ cardId: card.id, filename, data });
-        }
-      }
-      return card;
+      const attachmentErrors = await this.uploadAttachmentsBestEffort(
+        card.id,
+        req.attachments
+      );
+      return { card, attachmentErrors };
     });
     return collectBatchResults(settled);
   }
@@ -663,14 +694,32 @@ export class MochiClient {
         req,
         templateCache.get(req.templateId)
       );
-      if (req.attachments) {
-        for (const [filename, data] of Object.entries(req.attachments)) {
-          await this.addAttachment({ cardId: card.id, filename, data });
-        }
-      }
-      return card;
+      const attachmentErrors = await this.uploadAttachmentsBestEffort(
+        card.id,
+        req.attachments
+      );
+      return { card, attachmentErrors };
     });
     return collectBatchResults(settled);
+  }
+
+  private async uploadAttachmentsBestEffort(
+    cardId: string,
+    attachments: Record<string, string> | undefined
+  ): Promise<{ filename: string; error: string }[]> {
+    if (!attachments) return [];
+    const errors: { filename: string; error: string }[] = [];
+    for (const [filename, data] of Object.entries(attachments)) {
+      try {
+        await this.addAttachment({ cardId, filename, data });
+      } catch (e) {
+        errors.push({
+          filename,
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+    return errors;
   }
 
   async addAttachment(
