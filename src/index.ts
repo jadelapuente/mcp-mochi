@@ -173,6 +173,8 @@ const CreateCardsFromTemplateRequestSchema = z.object({
     ),
 });
 
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB decoded
+
 // Internal type for adding attachments (used by addAttachment method)
 interface AddAttachmentRequest {
   cardId: string;
@@ -743,6 +745,24 @@ export class MochiClient {
         pdf: "application/pdf",
       };
       contentType = mimeTypes[ext ?? ""] ?? "application/octet-stream";
+    }
+
+    // Reject oversize attachments before allocating a Buffer.
+    // Base64 inflates by ~4/3; 4/3 * 10MB ≈ 13.3M chars.
+    const estimatedBytes = Math.floor((request.data.length * 3) / 4);
+    if (estimatedBytes > MAX_ATTACHMENT_BYTES) {
+      throw new MochiError(
+        [
+          `Attachment "${request.filename}" is too large: ~${(
+            estimatedBytes /
+            1024 /
+            1024
+          ).toFixed(1)} MB exceeds the ${
+            MAX_ATTACHMENT_BYTES / 1024 / 1024
+          } MB limit.`,
+        ],
+        413
+      );
     }
 
     // Convert base64 to Buffer
