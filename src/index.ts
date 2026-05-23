@@ -492,7 +492,10 @@ export class MochiClient {
     request: UpdateCardRequest
   ): Promise<CreateCardResponse> {
     const mochiRequest = toMochiUpdateCardRequest(request);
-    const response = await this.api.post(`/cards/${cardId}`, mochiRequest);
+    const response = await this.api.post(
+      `/cards/${encodeURIComponent(cardId)}`,
+      mochiRequest
+    );
     return CreateCardResponseSchema.parse(response.data);
   }
 
@@ -545,7 +548,7 @@ export class MochiClient {
       ? GetDueCardsParamsSchema.parse(params)
       : undefined;
     const deckId = validatedParams?.deckId;
-    const endpoint = deckId ? `/due/${deckId}` : "/due";
+    const endpoint = deckId ? `/due/${encodeURIComponent(deckId)}` : "/due";
     const queryParams = validatedParams?.date
       ? { date: validatedParams.date }
       : undefined;
@@ -556,7 +559,9 @@ export class MochiClient {
   async getTemplate(
     templateId: string
   ): Promise<z.infer<typeof TemplateSchema>> {
-    const response = await this.api.get(`/templates/${templateId}`);
+    const response = await this.api.get(
+      `/templates/${encodeURIComponent(templateId)}`
+    );
     return TemplateSchema.parse(response.data);
   }
 
@@ -608,7 +613,7 @@ export class MochiClient {
   }
 
   async deleteCard(cardId: string): Promise<void> {
-    await this.api.delete(`/cards/${cardId}`);
+    await this.api.delete(`/cards/${encodeURIComponent(cardId)}`);
   }
 
   async createCards(requests: CreateCardRequest[]): Promise<BatchCreateResult> {
@@ -674,9 +679,9 @@ export class MochiClient {
 
     // Upload attachment
     await this.api.post(
-      `/cards/${request.cardId}/attachments/${encodeURIComponent(
-        request.filename
-      )}`,
+      `/cards/${encodeURIComponent(
+        request.cardId
+      )}/attachments/${encodeURIComponent(request.filename)}`,
       formData,
       {
         headers: {
