@@ -796,6 +796,78 @@ export class MochiClient {
       markdown: `![](${request.filename})`,
     };
   }
+
+  async updateCards(
+    items: BatchUpdateItem[]
+  ): Promise<BatchMutationResult> {
+    const settled = await runWithConcurrency(items, 3, async (item) => {
+      const { cardId, ...rest } = item;
+      await this.updateCard(cardId, rest);
+      return cardId;
+    });
+    return collectMutationResults(items, settled);
+  }
+
+  async archiveCards(
+    items: BatchArchiveItem[]
+  ): Promise<BatchMutationResult> {
+    const settled = await runWithConcurrency(items, 3, async (item) => {
+      await this.updateCard(item.cardId, { archived: item.archived });
+      return item.cardId;
+    });
+    return collectMutationResults(items, settled);
+  }
+
+  async deleteCards(
+    items: BatchDeleteItem[]
+  ): Promise<BatchMutationResult> {
+    const settled = await runWithConcurrency(items, 3, async (item) => {
+      await this.deleteCard(item.cardId);
+      return item.cardId;
+    });
+    return collectMutationResults(items, settled);
+  }
+}
+
+const BatchMutationResultSchema = z.object({
+  succeeded: z
+    .array(z.object({ cardId: z.string() }))
+    .describe("IDs of cards that were mutated successfully"),
+  failed: z
+    .array(
+      z.object({
+        index: z.number().describe("Zero-based index in the input array"),
+        cardId: z.string().describe("ID of the card that failed"),
+        error: z.string().describe("Error message"),
+      })
+    )
+    .describe("Cards that failed to mutate"),
+});
+type BatchMutationResult = z.infer<typeof BatchMutationResultSchema>;
+
+interface HasCardId {
+  cardId: string;
+}
+
+function collectMutationResults(
+  inputs: HasCardId[],
+  settled: PromiseSettledResult<string>[]
+): BatchMutationResult {
+  const succeeded: { cardId: string }[] = [];
+  const failed: BatchMutationResult["failed"] = [];
+  settled.forEach((r, i) => {
+    if (r.status === "fulfilled") {
+      succeeded.push({ cardId: r.value });
+    } else {
+      const err = r.reason;
+      failed.push({
+        index: i,
+        cardId: inputs[i].cardId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+  return { succeeded, failed };
 }
 
 // Server setup
@@ -840,6 +912,38 @@ const ArchiveFlashcardToolSchema = z.object({
     .default(true)
     .describe("Set to true to archive, false to unarchive"),
 });
+
+// Batch mutation schemas
+const UpdateFlashcardsRequestSchema = z.object({
+  updates: z
+    .array(UpdateFlashcardToolSchema)
+    .min(1)
+    .describe(
+      "Array of update operations. Each item must include cardId plus the fields to change. Use trashed: true here to soft-delete in bulk."
+    ),
+});
+
+const ArchiveFlashcardsRequestSchema = z.object({
+  archives: z
+    .array(ArchiveFlashcardToolSchema)
+    .min(1)
+    .describe(
+      "Array of archive/unarchive operations. Each item must include cardId; archived defaults to true."
+    ),
+});
+
+const DeleteFlashcardsRequestSchema = z.object({
+  deletes: z
+    .array(DeleteFlashcardToolSchema)
+    .min(1)
+    .describe(
+      "Array of cards to permanently delete. Cannot be undone. Use update_flashcards with trashed: true for soft delete."
+    ),
+});
+
+type BatchUpdateItem = z.infer<typeof UpdateFlashcardToolSchema>;
+type BatchArchiveItem = z.infer<typeof ArchiveFlashcardToolSchema>;
+type BatchDeleteItem = z.infer<typeof DeleteFlashcardToolSchema>;
 
 // Create Mochi client
 const mochiClient = new MochiClient(API_KEY);
@@ -1039,6 +1143,90 @@ server.registerTool(
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
+      };
+    } catch (error) {
+      return formatToolError(error);
+    }
+  }
+);
+
+server.registerTool(
+  "update_flashcards",
+  {
+    title: "Update flashcards on Mochi (batch)",
+    description:
+      "Update one or more flashcards in a single call. Pass an array even for one card. Use trashed: true to soft-delete in bulk, or set deckId to move cards between decks. Returns per-card results; partial success is supported.",
+    inputSchema: UpdateFlashcardsRequestSchema,
+    outputSchema: BatchMutationResultSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async (args: z.infer<typeof UpdateFlashcardsRequestSchema>) => {
+    try {
+      const result = await mochiClient.updateCards(args.updates);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        structuredContent: result,
+      };
+    } catch (error) {
+      return formatToolError(error);
+    }
+  }
+);
+
+server.registerTool(
+  "archive_flashcards",
+  {
+    title: "Archive flashcards on Mochi (batch)",
+    description:
+      "Archive or unarchive one or more flashcards in a single call. Pass an array even for one card. Returns per-card results; partial success is supported.",
+    inputSchema: ArchiveFlashcardsRequestSchema,
+    outputSchema: BatchMutationResultSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+  async (args: z.infer<typeof ArchiveFlashcardsRequestSchema>) => {
+    try {
+      const result = await mochiClient.archiveCards(args.archives);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        structuredContent: result,
+      };
+    } catch (error) {
+      return formatToolError(error);
+    }
+  }
+);
+
+server.registerTool(
+  "delete_flashcards",
+  {
+    title: "Delete flashcards on Mochi (batch)",
+    description:
+      "Permanently delete one or more flashcards. WARNING: cannot be undone. For soft delete, use update_flashcards with trashed: true. Returns per-card results; partial success is supported.",
+    inputSchema: DeleteFlashcardsRequestSchema,
+    outputSchema: BatchMutationResultSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+  async (args: z.infer<typeof DeleteFlashcardsRequestSchema>) => {
+    try {
+      const result = await mochiClient.deleteCards(args.deletes);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        structuredContent: result,
       };
     } catch (error) {
       return formatToolError(error);
