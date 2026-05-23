@@ -181,6 +181,7 @@ const CreateCardsFromTemplateRequestSchema = z.object({
 });
 
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB decoded
+const MAX_RESOURCE_PAGES = 50; // Safety cap when paginating resources
 
 // Internal type for adding attachments (used by addAttachment method)
 interface AddAttachmentRequest {
@@ -714,6 +715,24 @@ export class MochiClient {
     };
   }
 
+  /**
+   * Paginate through all decks, capped at `maxPages` to keep cost bounded.
+   * Resources should expose the full list, not just page 1.
+   */
+  async listAllDecks(
+    maxPages = MAX_RESOURCE_PAGES
+  ): Promise<z.infer<typeof DeckSchema>[]> {
+    const all: z.infer<typeof DeckSchema>[] = [];
+    let bookmark: string | undefined;
+    for (let i = 0; i < maxPages; i++) {
+      const page = await this.listDecks(bookmark ? { bookmark } : undefined);
+      all.push(...page.docs);
+      if (!page.bookmark || page.docs.length === 0) break;
+      bookmark = page.bookmark;
+    }
+    return all.sort((a, b) => a.sort - b.sort);
+  }
+
   async listCards(params?: ListCardsParams): Promise<ListCardsResponse> {
     const validatedParams = params
       ? ListCardsParamsSchema.parse(params)
@@ -824,6 +843,25 @@ export class MochiClient {
       bookmark: data?.bookmark ?? "",
       docs: slimDocs,
     });
+  }
+
+  /**
+   * Paginate through all templates (slim shape), capped at `maxPages`.
+   */
+  async listAllTemplates(
+    maxPages = MAX_RESOURCE_PAGES
+  ): Promise<ListTemplatesResponse["docs"]> {
+    const all: ListTemplatesResponse["docs"] = [];
+    let bookmark: string | undefined;
+    for (let i = 0; i < maxPages; i++) {
+      const page = await this.listTemplates(
+        bookmark ? { bookmark, verbose: false } : { verbose: false }
+      );
+      all.push(...page.docs);
+      if (!page.bookmark || page.docs.length === 0) break;
+      bookmark = page.bookmark;
+    }
+    return all;
   }
 
   async getDueCards(
@@ -1661,14 +1699,14 @@ server.registerResource(
     mimeType: "application/json",
   },
   async () => {
-    const response = await mochiClient.listDecks();
+    const decks = await mochiClient.listAllDecks();
     return {
       contents: [
         {
           uri: "mochi://decks",
           mimeType: "application/json",
           text: JSON.stringify(
-            response.docs.map((deck) => ({ id: deck.id, name: deck.name })),
+            decks.map((deck) => ({ id: deck.id, name: deck.name })),
             null,
             2
           ),
@@ -1686,13 +1724,13 @@ server.registerResource(
     mimeType: "application/json",
   },
   async () => {
-    const templates = await mochiClient.listTemplates();
+    const templates = await mochiClient.listAllTemplates();
     return {
       contents: [
         {
           uri: "mochi://templates",
           mimeType: "application/json",
-          text: JSON.stringify(templates, null, 2),
+          text: JSON.stringify({ docs: templates }, null, 2),
         },
       ],
     };
