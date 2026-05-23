@@ -500,6 +500,134 @@ function getApiKey(): string {
 
 const API_KEY = getApiKey();
 
+// ---- Search helpers ---------------------------------------------------------
+
+/** Lowercase, collapse whitespace, strip punctuation that distorts trigrams. */
+export function normalizeForSearch(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[`*_~#>\-]+/g, " ") // markdown punctuation that noises trigrams
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Build the set of 3-character sliding windows after normalization. */
+export function trigrams(s: string): Set<string> {
+  const norm = normalizeForSearch(s);
+  const out = new Set<string>();
+  if (norm.length === 0) return out;
+  if (norm.length < 3) {
+    out.add(norm);
+    return out;
+  }
+  for (let i = 0; i <= norm.length - 3; i++) {
+    out.add(norm.slice(i, i + 3));
+  }
+  return out;
+}
+
+/** Jaccard similarity of two trigram sets in [0, 1]. */
+export function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
+/** Extract a snippet of approx `contextChars` characters around an index. */
+export function extractSnippet(
+  content: string,
+  matchIndex: number,
+  contextChars: number
+): string {
+  const start = Math.max(0, matchIndex - Math.floor(contextChars / 2));
+  const end = Math.min(content.length, start + contextChars);
+  const slice = content.slice(start, end).replace(/\s+/g, " ").trim();
+  const prefix = start > 0 ? "…" : "";
+  const suffix = end < content.length ? "…" : "";
+  return `${prefix}${slice}${suffix}`;
+}
+
+const SearchFlashcardsParamsSchema = z.object({
+  query: z.string().min(1).describe("Text to search for"),
+  deckId: z
+    .string()
+    .optional()
+    .describe("Restrict the scan to a single deck. Strongly recommended."),
+  mode: z
+    .enum(["substring", "fuzzy"])
+    .optional()
+    .default("substring")
+    .describe(
+      "substring: case-insensitive substring match (default). fuzzy: trigram Jaccard similarity — use for near-duplicate detection."
+    ),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .optional()
+    .default(20)
+    .describe("Max matches to return"),
+  maxScanned: z
+    .number()
+    .int()
+    .min(1)
+    .max(10000)
+    .optional()
+    .default(2000)
+    .describe(
+      "Hard cap on cards scanned. If reached, the response sets truncated:true."
+    ),
+  threshold: z
+    .number()
+    .min(0)
+    .max(1)
+    .optional()
+    .default(0.3)
+    .describe(
+      "Minimum Jaccard score (0-1) for a fuzzy match. Ignored in substring mode."
+    ),
+  contextChars: z
+    .number()
+    .int()
+    .min(20)
+    .max(500)
+    .optional()
+    .default(120)
+    .describe("Approximate snippet length around the match (substring mode)."),
+});
+
+const SearchMatchSchema = z.object({
+  id: z.string().describe("Card ID"),
+  "deck-id": z.string().describe("ID of the deck containing the card"),
+  snippet: z
+    .string()
+    .describe(
+      "Whitespace-collapsed excerpt of the card content around the match (substring) or the start of the content (fuzzy)."
+    ),
+  score: z
+    .number()
+    .optional()
+    .describe(
+      "Similarity score (0-1). Present in fuzzy mode only; higher = more similar."
+    ),
+});
+
+const SearchFlashcardsResponseSchema = z.object({
+  matches: z.array(SearchMatchSchema),
+  scanned: z.number().describe("Number of cards scanned"),
+  truncated: z
+    .boolean()
+    .describe(
+      "True if the scan hit maxScanned before finishing. Re-run with a higher maxScanned or scope by deckId to be exhaustive."
+    ),
+});
+
+type SearchFlashcardsParams = z.infer<typeof SearchFlashcardsParamsSchema>;
+type SearchFlashcardsResponse = z.infer<typeof SearchFlashcardsResponseSchema>;
+
 export class MochiClient {
   private api: AxiosInstance;
   private token: string;
@@ -595,10 +723,76 @@ export class MochiClient {
       : undefined;
     const response = await this.api.get("/cards", { params: mochiParams });
     const parsed = ListCardsResponseSchema.parse(response.data);
-    
+
     return {
       bookmark: parsed.bookmark,
       docs: parsed.docs.filter((card) => !card["archived?"] && !card["trashed?"]),
+    };
+  }
+
+  async searchCards(
+    params: SearchFlashcardsParams
+  ): Promise<SearchFlashcardsResponse> {
+    const { query, deckId, mode, limit, maxScanned, threshold, contextChars } =
+      SearchFlashcardsParamsSchema.parse(params);
+
+    const queryTrigrams = mode === "fuzzy" ? trigrams(query) : null;
+    const queryLower = mode === "substring" ? query.toLowerCase() : null;
+
+    const matches: z.infer<typeof SearchMatchSchema>[] = [];
+    let scanned = 0;
+    let bookmark: string | undefined;
+    let truncated = false;
+
+    while (scanned < maxScanned) {
+      const remainingScan = maxScanned - scanned;
+      const page = await this.listCards({
+        deckId,
+        limit: Math.min(100, Math.max(1, remainingScan)),
+        bookmark,
+      });
+
+      for (const card of page.docs) {
+        if (scanned >= maxScanned) {
+          truncated = true;
+          break;
+        }
+        scanned++;
+        const content = card.content ?? "";
+        if (mode === "substring") {
+          const idx = content.toLowerCase().indexOf(queryLower!);
+          if (idx !== -1) {
+            matches.push({
+              id: card.id,
+              "deck-id": card["deck-id"],
+              snippet: extractSnippet(content, idx, contextChars),
+            });
+          }
+        } else {
+          const score = jaccard(queryTrigrams!, trigrams(content));
+          if (score >= threshold) {
+            matches.push({
+              id: card.id,
+              "deck-id": card["deck-id"],
+              snippet: extractSnippet(content, 0, contextChars),
+              score,
+            });
+          }
+        }
+      }
+
+      if (!page.bookmark || page.docs.length === 0) break;
+      bookmark = page.bookmark;
+    }
+
+    if (mode === "fuzzy") {
+      matches.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    }
+
+    return {
+      matches: matches.slice(0, limit),
+      scanned,
+      truncated,
     };
   }
 
@@ -1309,6 +1503,34 @@ server.registerTool(
   async (args) => {
     try {
       const response = await mochiClient.listCards(args);
+      return {
+        content: [{ type: "text", text: JSON.stringify(response) }],
+        structuredContent: response,
+      };
+    } catch (error) {
+      return formatToolError(error);
+    }
+  }
+);
+
+server.registerTool(
+  "search_flashcards",
+  {
+    title: "Search flashcards on Mochi",
+    description:
+      "Find cards by content. Two modes: substring (case-insensitive default, cheap) and fuzzy (trigram Jaccard, for near-duplicate detection). Pass deckId to scope the scan — strongly recommended. Bounded by maxScanned; check `truncated` in the response.",
+    inputSchema: SearchFlashcardsParamsSchema.shape,
+    outputSchema: SearchFlashcardsResponseSchema,
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async (args: z.infer<typeof SearchFlashcardsParamsSchema>) => {
+    try {
+      const response = await mochiClient.searchCards(args);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
