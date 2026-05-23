@@ -108,6 +108,13 @@ const ListTemplatesParamsSchema = z.object({
     .string()
     .optional()
     .describe("Pagination bookmark for fetching next page of results"),
+  verbose: z
+    .boolean()
+    .optional()
+    .default(false)
+    .describe(
+      "If true, include full template content and per-field details. Default false returns only id/name/position and field id+name, which is sufficient for picking a template and supplying create_cards_from_template fields."
+    ),
 });
 
 const GetTemplateParamsSchema = z.object({
@@ -259,10 +266,26 @@ const TemplateSchema = z
   })
   .strip();
 
+const SlimTemplateFieldSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+});
+
+const SlimTemplateSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  pos: z.string(),
+  fields: z.array(SlimTemplateFieldSchema),
+});
+
 const ListTemplatesResponseSchema = z
   .object({
     bookmark: z.string().describe("Pagination bookmark for fetching next page"),
-    docs: z.array(TemplateSchema).describe("Array of templates"),
+    docs: z
+      .array(z.union([TemplateSchema, SlimTemplateSchema]))
+      .describe(
+        "Array of templates. Slim by default (id, name, pos, field id+name). Pass verbose:true to get full template content and field details."
+      ),
   })
   .strip();
 
@@ -319,11 +342,16 @@ type CreateCardResponse = z.infer<typeof CreateCardResponseSchema>;
 type ListDecksResponse = z.infer<typeof ListDecksResponseSchema>;
 type ListCardsResponse = z.infer<typeof ListCardsResponseSchema>;
 
+const SlimCreatedCardSchema = z.object({
+  id: z.string().describe("Mochi card ID"),
+  "deck-id": z.string().describe("ID of the deck the card was created in"),
+});
+
 const BatchCreateResultSchema = z.object({
   created: z
-    .array(CardSchema)
+    .array(SlimCreatedCardSchema)
     .describe(
-      "Successfully created cards. These cards exist on Mochi — do NOT retry creating them, even if attachmentErrors references them."
+      "Successfully created cards (id + deck-id only — content was supplied by the caller and is not echoed back). These cards exist on Mochi — do NOT retry creating them, even if attachmentErrors references them."
     ),
   failed: z
     .array(
@@ -362,12 +390,12 @@ interface BatchAttemptResult {
 function collectBatchResults(
   settled: PromiseSettledResult<BatchAttemptResult>[]
 ): BatchCreateResult {
-  const created: CreateCardResponse[] = [];
+  const created: BatchCreateResult["created"] = [];
   const failed: { index: number; error: string }[] = [];
   const attachmentErrors: BatchCreateResult["attachmentErrors"] = [];
   settled.forEach((r, i) => {
     if (r.status === "fulfilled") {
-      created.push(r.value.card);
+      created.push({ id: r.value.card.id, "deck-id": r.value.card["deck-id"] });
       for (const ae of r.value.attachmentErrors) {
         attachmentErrors.push({
           index: i,
@@ -569,10 +597,28 @@ export class MochiClient {
     const validatedParams = params
       ? ListTemplatesParamsSchema.parse(params)
       : undefined;
+    // `verbose` is for our slimming logic, not a Mochi query param.
+    const { verbose, ...mochiParams } = validatedParams ?? {};
     const response = await this.api.get("/templates", {
-      params: validatedParams,
+      params: Object.keys(mochiParams).length ? mochiParams : undefined,
     });
-    return ListTemplatesResponseSchema.parse(response.data);
+    const data = response.data;
+    if (verbose) {
+      return ListTemplatesResponseSchema.parse(data);
+    }
+    const slimDocs = (data?.docs ?? []).map((t: z.infer<typeof TemplateSchema>) => ({
+      id: t.id,
+      name: t.name,
+      pos: t.pos,
+      fields: Object.entries(t.fields ?? {}).map(([id, f]) => ({
+        id,
+        name: f.name,
+      })),
+    }));
+    return ListTemplatesResponseSchema.parse({
+      bookmark: data?.bookmark ?? "",
+      docs: slimDocs,
+    });
   }
 
   async getDueCards(
