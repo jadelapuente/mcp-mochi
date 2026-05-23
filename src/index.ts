@@ -600,6 +600,21 @@ export class MochiClient {
     // Build content from field values (joined with separator for multi-field templates)
     const content = fieldValues.join("\n---\n");
 
+    // Refuse to create empty cards from broken templates / empty fields
+    if (content.trim().length === 0) {
+      throw new MochiError(
+        [
+          `Refusing to create empty card: all provided fields are blank. ` +
+            `Template "${template.name}" expects fields: ${Object.values(
+              template.fields
+            )
+              .map((f) => f.name)
+              .join(", ")}.`,
+        ],
+        400
+      );
+    }
+
     const mochiRequest = {
       content,
       "deck-id": request.deckId,
