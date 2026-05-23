@@ -155,6 +155,24 @@ const CreateCardFromTemplateSchema = z.object({
     ),
 });
 
+const CreateCardsRequestSchema = z.object({
+  cards: z
+    .array(CreateCardRequestSchema)
+    .min(1)
+    .describe(
+      "Array of cards to create. Pass an array even for a single card."
+    ),
+});
+
+const CreateCardsFromTemplateRequestSchema = z.object({
+  cards: z
+    .array(CreateCardFromTemplateSchema)
+    .min(1)
+    .describe(
+      "Array of template-based cards to create. Pass an array even for a single card."
+    ),
+});
+
 // Internal type for adding attachments (used by addAttachment method)
 interface AddAttachmentRequest {
   cardId: string;
@@ -298,6 +316,67 @@ const ListCardsResponseSchema = z
 type CreateCardResponse = z.infer<typeof CreateCardResponseSchema>;
 type ListDecksResponse = z.infer<typeof ListDecksResponseSchema>;
 type ListCardsResponse = z.infer<typeof ListCardsResponseSchema>;
+
+const BatchCreateResultSchema = z.object({
+  created: z
+    .array(CardSchema)
+    .describe("Successfully created cards, in input order"),
+  failed: z
+    .array(
+      z.object({
+        index: z
+          .number()
+          .describe("Zero-based index in the input array that failed"),
+        error: z.string().describe("Error message for the failed card"),
+      })
+    )
+    .describe("Cards that failed to create"),
+});
+type BatchCreateResult = z.infer<typeof BatchCreateResultSchema>;
+
+function collectBatchResults(
+  settled: PromiseSettledResult<CreateCardResponse>[]
+): BatchCreateResult {
+  const created: CreateCardResponse[] = [];
+  const failed: { index: number; error: string }[] = [];
+  settled.forEach((r, i) => {
+    if (r.status === "fulfilled") {
+      created.push(r.value);
+    } else {
+      const err = r.reason;
+      failed.push({
+        index: i,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+  return { created, failed };
+}
+
+async function runWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<PromiseSettledResult<R>[]> {
+  const results: PromiseSettledResult<R>[] = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from(
+    { length: Math.min(limit, items.length) },
+    async () => {
+      while (true) {
+        const i = cursor++;
+        if (i >= items.length) return;
+        try {
+          results[i] = { status: "fulfilled", value: await fn(items[i], i) };
+        } catch (e) {
+          results[i] = { status: "rejected", reason: e };
+        }
+      }
+    }
+  );
+  await Promise.all(workers);
+  return results;
+}
 
 const DeckSchema = z
   .object({
@@ -532,6 +611,34 @@ export class MochiClient {
     await this.api.delete(`/cards/${cardId}`);
   }
 
+  async createCards(requests: CreateCardRequest[]): Promise<BatchCreateResult> {
+    const settled = await runWithConcurrency(requests, 3, async (req) => {
+      const card = await this.createCard(req);
+      if (req.attachments) {
+        for (const [filename, data] of Object.entries(req.attachments)) {
+          await this.addAttachment({ cardId: card.id, filename, data });
+        }
+      }
+      return card;
+    });
+    return collectBatchResults(settled);
+  }
+
+  async createCardsFromTemplate(
+    requests: CreateCardFromTemplateParams[]
+  ): Promise<BatchCreateResult> {
+    const settled = await runWithConcurrency(requests, 3, async (req) => {
+      const card = await this.createCardFromTemplate(req);
+      if (req.attachments) {
+        for (const [filename, data] of Object.entries(req.attachments)) {
+          await this.addAttachment({ cardId: card.id, filename, data });
+        }
+      }
+      return card;
+    });
+    return collectBatchResults(settled);
+  }
+
   async addAttachment(
     request: AddAttachmentRequest
   ): Promise<{ filename: string; markdown: string }> {
@@ -685,13 +792,13 @@ function formatToolError(error: unknown): {
 // Register tools
 // Note: Using type assertions due to Zod version compatibility between SDK (v4) and project (v3)
 server.registerTool(
-  "create_flashcard",
+  "create_flashcards",
   {
-    title: "Create flashcard on Mochi",
+    title: "Create flashcards on Mochi",
     description:
-      "Create a new flashcard. Get deckId from list_decks. To add images/audio: 1) Reference in content as ![](filename.png), 2) Add to attachments object as { 'filename.png': 'base64data' }. Filename must be alphanumeric 4-16 chars + extension.",
-    inputSchema: CreateCardRequestSchema,
-    outputSchema: CreateCardResponseSchema,
+      "Create one or more flashcards in a single call. Always pass an array, even for a single card. Get deckId from list_decks. To add images/audio: 1) Reference in content as ![](filename.png), 2) Add to attachments as { 'filename.png': 'base64data' }. Returns per-card results; partial success is supported.",
+    inputSchema: CreateCardsRequestSchema,
+    outputSchema: BatchCreateResultSchema,
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -699,24 +806,12 @@ server.registerTool(
       openWorldHint: true,
     },
   },
-  async (args: CreateCardRequest) => {
+  async (args: z.infer<typeof CreateCardsRequestSchema>) => {
     try {
-      const response = await mochiClient.createCard(args);
-
-      // Upload attachments if provided
-      if (args.attachments) {
-        for (const [filename, data] of Object.entries(args.attachments)) {
-          await mochiClient.addAttachment({
-            cardId: response.id,
-            filename,
-            data,
-          });
-        }
-      }
-
+      const result = await mochiClient.createCards(args.cards);
       return {
-        content: [{ type: "text", text: JSON.stringify(response) }],
-        structuredContent: response,
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        structuredContent: result,
       };
     } catch (error) {
       return formatToolError(error);
@@ -725,13 +820,13 @@ server.registerTool(
 );
 
 server.registerTool(
-  "create_card_from_template",
+  "create_cards_from_template",
   {
-    title: "Create flashcard from template on Mochi",
+    title: "Create flashcards from template on Mochi",
     description:
-      "Create a flashcard using a template. Maps field names to IDs automatically. Supports attachments: reference as ![](filename.png) in fields, provide data in attachments object.",
-    inputSchema: CreateCardFromTemplateSchema,
-    outputSchema: CreateCardResponseSchema,
+      "Create one or more flashcards from a template in a single call. Always pass an array, even for a single card. Maps field names to IDs automatically. Returns per-card results; partial success is supported.",
+    inputSchema: CreateCardsFromTemplateRequestSchema,
+    outputSchema: BatchCreateResultSchema,
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -739,24 +834,12 @@ server.registerTool(
       openWorldHint: true,
     },
   },
-  async (args: CreateCardFromTemplateParams) => {
+  async (args: z.infer<typeof CreateCardsFromTemplateRequestSchema>) => {
     try {
-      const response = await mochiClient.createCardFromTemplate(args);
-
-      // Upload attachments if provided
-      if (args.attachments) {
-        for (const [filename, data] of Object.entries(args.attachments)) {
-          await mochiClient.addAttachment({
-            cardId: response.id,
-            filename,
-            data,
-          });
-        }
-      }
-
+      const result = await mochiClient.createCardsFromTemplate(args.cards);
       return {
-        content: [{ type: "text", text: JSON.stringify(response) }],
-        structuredContent: response,
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        structuredContent: result,
       };
     } catch (error) {
       return formatToolError(error);
