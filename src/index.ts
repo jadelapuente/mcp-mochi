@@ -566,10 +566,10 @@ export class MochiClient {
   }
 
   async createCardFromTemplate(
-    request: CreateCardFromTemplateParams
+    request: CreateCardFromTemplateParams,
+    cachedTemplate?: z.infer<typeof TemplateSchema>
   ): Promise<CreateCardResponse> {
-    // Fetch the template to get field definitions
-    const template = await this.getTemplate(request.templateId);
+    const template = cachedTemplate ?? (await this.getTemplate(request.templateId));
 
     // Map field names to IDs
     const fieldNameToId: Record<string, string> = {};
@@ -647,8 +647,22 @@ export class MochiClient {
   async createCardsFromTemplate(
     requests: CreateCardFromTemplateParams[]
   ): Promise<BatchCreateResult> {
+    // Fetch each unique template only once for the whole batch
+    const uniqueTemplateIds = Array.from(
+      new Set(requests.map((r) => r.templateId))
+    );
+    const templateCache = new Map<string, z.infer<typeof TemplateSchema>>();
+    await Promise.all(
+      uniqueTemplateIds.map(async (id) => {
+        templateCache.set(id, await this.getTemplate(id));
+      })
+    );
+
     const settled = await runWithConcurrency(requests, 3, async (req) => {
-      const card = await this.createCardFromTemplate(req);
+      const card = await this.createCardFromTemplate(
+        req,
+        templateCache.get(req.templateId)
+      );
       if (req.attachments) {
         for (const [filename, data] of Object.entries(req.attachments)) {
           await this.addAttachment({ cardId: card.id, filename, data });
