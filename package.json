@@ -16,7 +16,8 @@
     "start": "node dist/index.js",
     "dev": "ts-node-esm src/index.ts",
     "dev:inspect": "npx @modelcontextprotocol/inspector ts-node-esm src/index.ts",
-    "test": "jest",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "prepublishOnly": "npm run build",
     "version:minor": "npm version minor",
     "release:minor": "npm run version:minor && npm publish"
@@ -42,6 +43,7 @@
   "devDependencies": {
     "@types/node": "^20.11.24",
     "ts-node": "^10.9.2",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vitest": "^4.1.7"
   }
 }
