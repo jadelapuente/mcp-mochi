@@ -544,6 +544,17 @@ export class MochiClient {
   }
 
   async createCard(request: CreateCardRequest): Promise<CreateCardResponse> {
+    // Attachments are handled in createCards()/createCardsFromTemplate(),
+    // not here, because they require a second request after the card is
+    // created. Reject up front so a direct caller doesn't get silent drops.
+    if (request.attachments && Object.keys(request.attachments).length > 0) {
+      throw new MochiError(
+        [
+          "createCard does not upload attachments. Use createCards (batch) which handles attachments after creating each card.",
+        ],
+        400
+      );
+    }
     const mochiRequest = toMochiCreateCardRequest(request);
     const response = await this.api.post("/cards", mochiRequest);
     return CreateCardResponseSchema.parse(response.data);
@@ -919,7 +930,7 @@ function collectMutationResults(
 // Server setup
 const server = new McpServer({
   name: "mcp-server/mochi",
-  version: "1.0.3",
+  version: "2.6.0",
 });
 
 // Schema for update flashcard tool (combines cardId with update fields)
