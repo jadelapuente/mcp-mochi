@@ -2,6 +2,7 @@
 
 import axios, { AxiosInstance } from "axios";
 import FormData from "form-data";
+import { fileURLToPath } from "node:url";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -17,7 +18,7 @@ dotenv.config();
  * - Array: ["Error message 1", "Error message 2"]
  * - Object: { "field": "Error message" }
  */
-class MochiError extends Error {
+export class MochiError extends Error {
   errors: string[] | Record<string, string>;
   statusCode: number;
 
@@ -493,13 +494,10 @@ const GetDueCardsResponseSchema = z.object({
 function getApiKey(): string {
   const apiKey = process.env.MOCHI_API_KEY;
   if (!apiKey) {
-    console.error("MOCHI_API_KEY environment variable is not set");
-    process.exit(1);
+    throw new Error("MOCHI_API_KEY environment variable is not set");
   }
   return apiKey;
 }
-
-const API_KEY = getApiKey();
 
 // ---- Search helpers ---------------------------------------------------------
 
@@ -633,8 +631,18 @@ export class MochiClient {
   private api: AxiosInstance;
   private token: string;
 
-  constructor(token: string) {
+  /**
+   * @param token   Mochi API token
+   * @param apiOverride  Inject an AxiosInstance (used by tests). When
+   *                     provided, no interceptor is attached — the caller
+   *                     is expected to control responses directly.
+   */
+  constructor(token: string, apiOverride?: AxiosInstance) {
     this.token = token;
+    if (apiOverride) {
+      this.api = apiOverride;
+      return;
+    }
     this.api = axios.create({
       baseURL: "https://app.mochi.cards/api/",
       timeout: 30000,
@@ -956,10 +964,14 @@ export class MochiClient {
 
   async createCards(requests: CreateCardRequest[]): Promise<BatchCreateResult> {
     const settled = await runWithConcurrency(requests, 3, async (req) => {
-      const card = await this.createCard(req);
+      // Strip attachments before createCard — the singular path refuses
+      // them by design (it can't upload). The batch wrapper uploads
+      // attachments itself after the card is created.
+      const { attachments, ...cardReq } = req;
+      const card = await this.createCard(cardReq);
       const attachmentErrors = await this.uploadAttachmentsBestEffort(
         card.id,
-        req.attachments
+        attachments
       );
       return { card, attachmentErrors };
     });
@@ -1234,8 +1246,13 @@ type BatchUpdateItem = z.infer<typeof UpdateFlashcardToolSchema>;
 type BatchArchiveItem = z.infer<typeof ArchiveFlashcardToolSchema>;
 type BatchDeleteItem = z.infer<typeof DeleteFlashcardToolSchema>;
 
-// Create Mochi client
-const mochiClient = new MochiClient(API_KEY);
+// Create Mochi client lazily so importing this module for tests doesn't
+// crash on a missing MOCHI_API_KEY.
+let _mochiClient: MochiClient | null = null;
+function getMochi(): MochiClient {
+  if (!_mochiClient) _mochiClient = new MochiClient(getApiKey());
+  return _mochiClient;
+}
 
 // Helper to format errors for tool responses
 function formatToolError(error: unknown): {
@@ -1304,7 +1321,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof CreateCardsRequestSchema>) => {
     try {
-      const result = await mochiClient.createCards(args.cards);
+      const result = await getMochi().createCards(args.cards);
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
         structuredContent: result,
@@ -1332,7 +1349,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof CreateCardsFromTemplateRequestSchema>) => {
     try {
-      const result = await mochiClient.createCardsFromTemplate(args.cards);
+      const result = await getMochi().createCardsFromTemplate(args.cards);
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
         structuredContent: result,
@@ -1361,7 +1378,7 @@ server.registerTool(
   async (args: z.infer<typeof UpdateFlashcardToolSchema>) => {
     try {
       const { cardId, ...updateArgs } = args;
-      const response = await mochiClient.updateCard(cardId, updateArgs);
+      const response = await getMochi().updateCard(cardId, updateArgs);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
@@ -1397,7 +1414,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof DeleteFlashcardToolSchema>) => {
     try {
-      await mochiClient.deleteCard(args.cardId);
+      await getMochi().deleteCard(args.cardId);
       const response = { success: true, cardId: args.cardId };
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
@@ -1426,7 +1443,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof ArchiveFlashcardToolSchema>) => {
     try {
-      const response = await mochiClient.updateCard(args.cardId, {
+      const response = await getMochi().updateCard(args.cardId, {
         archived: args.archived,
       });
       return {
@@ -1456,7 +1473,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof UpdateFlashcardsRequestSchema>) => {
     try {
-      const result = await mochiClient.updateCards(args.updates);
+      const result = await getMochi().updateCards(args.updates);
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
         structuredContent: result,
@@ -1484,7 +1501,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof ArchiveFlashcardsRequestSchema>) => {
     try {
-      const result = await mochiClient.archiveCards(args.archives);
+      const result = await getMochi().archiveCards(args.archives);
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
         structuredContent: result,
@@ -1512,7 +1529,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof DeleteFlashcardsRequestSchema>) => {
     try {
-      const result = await mochiClient.deleteCards(args.deletes);
+      const result = await getMochi().deleteCards(args.deletes);
       return {
         content: [{ type: "text", text: JSON.stringify(result) }],
         structuredContent: result,
@@ -1540,7 +1557,7 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const response = await mochiClient.listCards(args);
+      const response = await getMochi().listCards(args);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
@@ -1568,7 +1585,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof SearchFlashcardsParamsSchema>) => {
     try {
-      const response = await mochiClient.searchCards(args);
+      const response = await getMochi().searchCards(args);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
@@ -1595,7 +1612,7 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const response = await mochiClient.listDecks(args);
+      const response = await getMochi().listDecks(args);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
@@ -1623,7 +1640,7 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const response = await mochiClient.listTemplates(args);
+      const response = await getMochi().listTemplates(args);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
@@ -1651,7 +1668,7 @@ server.registerTool(
   },
   async (args: z.infer<typeof GetTemplateParamsSchema>) => {
     try {
-      const response = await mochiClient.getTemplate(args.templateId);
+      const response = await getMochi().getTemplate(args.templateId);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
@@ -1679,7 +1696,7 @@ server.registerTool(
   },
   async (args) => {
     try {
-      const response = await mochiClient.getDueCards(args);
+      const response = await getMochi().getDueCards(args);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
@@ -1699,7 +1716,7 @@ server.registerResource(
     mimeType: "application/json",
   },
   async () => {
-    const decks = await mochiClient.listAllDecks();
+    const decks = await getMochi().listAllDecks();
     return {
       contents: [
         {
@@ -1724,7 +1741,7 @@ server.registerResource(
     mimeType: "application/json",
   },
   async () => {
-    const templates = await mochiClient.listAllTemplates();
+    const templates = await getMochi().listAllTemplates();
     return {
       contents: [
         {
@@ -1774,7 +1791,19 @@ async function runServer() {
   await server.connect(transport);
 }
 
-runServer().catch((error) => {
-  console.error("Fatal error running server:", error);
-  process.exit(1);
-});
+// Only auto-start when this file is the process entry point. Importing
+// it from tests must not connect to stdio or exit on missing env.
+const isMainModule = (() => {
+  try {
+    return process.argv[1] === fileURLToPath(import.meta.url);
+  } catch {
+    return false;
+  }
+})();
+
+if (isMainModule) {
+  runServer().catch((error) => {
+    console.error("Fatal error running server:", error);
+    process.exit(1);
+  });
+}
