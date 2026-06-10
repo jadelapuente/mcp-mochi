@@ -83,11 +83,48 @@ const UpdateCardRequestSchema = z.object({
     .describe("Updated map of field IDs to field values"),
 });
 
+const CreateDeckRequestSchema = z.object({
+  name: z.string().min(1).describe("Display name of the deck"),
+  parentId: z
+    .string()
+    .optional()
+    .describe(
+      "Optional ID of a parent deck to nest this deck under as a subdeck. Omit to create a top-level deck."
+    ),
+});
+
+const UpdateDeckRequestSchema = z.object({
+  name: z.string().min(1).optional().describe("New display name for the deck"),
+  parentId: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      "New parent deck ID to re-home this deck under as a subdeck. Pass null to move it to the top level."
+    ),
+  trashed: z
+    .boolean()
+    .optional()
+    .describe("Set true to soft-delete (trash) the deck, false to restore it."),
+});
+
 const ListDecksParamsSchema = z.object({
   bookmark: z
     .string()
     .optional()
     .describe("Pagination bookmark for fetching next page of results"),
+  deckId: z
+    .string()
+    .optional()
+    .describe(
+      "Scope results to a single deck. Without includeSubdecks, returns just that deck. With includeSubdecks: true, returns the deck plus its full nested subtree. When set, results are not paginated (bookmark is empty)."
+    ),
+  includeSubdecks: z
+    .boolean()
+    .optional()
+    .describe(
+      "When deckId is set, also return all descendant subdecks (the full subtree, any depth). Ignored when deckId is not set."
+    ),
 });
 
 const ListCardsParamsSchema = z.object({
@@ -102,6 +139,12 @@ const ListCardsParamsSchema = z.object({
     .string()
     .optional()
     .describe("Pagination bookmark for fetching next page of results"),
+  includeSubdecks: z
+    .boolean()
+    .optional()
+    .describe(
+      "When true (requires deckId), also return cards from every descendant subdeck, grouped together. Results are aggregated (not paginated) and bounded by a cap — check `truncated` in the response. Plain deckId without this flag returns only cards directly in that deck."
+    ),
 });
 
 const ListTemplatesParamsSchema = z.object({
@@ -183,6 +226,7 @@ const CreateCardsFromTemplateRequestSchema = z.object({
 
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB decoded
 const MAX_RESOURCE_PAGES = 50; // Safety cap when paginating resources
+const MAX_CASCADE_CARDS = 2000; // Safety cap when aggregating cards across a subdeck subtree
 
 // Internal type for adding attachments (used by addAttachment method)
 interface AddAttachmentRequest {
@@ -215,6 +259,24 @@ function toMochiUpdateCardRequest(
   if (params.archived !== undefined) result["archived?"] = params.archived;
   if (params.trashed !== undefined) result["trashed?"] = params.trashed;
   if (params.fields !== undefined) result.fields = params.fields;
+  return result;
+}
+
+function toMochiCreateDeckRequest(
+  params: CreateDeckRequest
+): Record<string, unknown> {
+  const result: Record<string, unknown> = { name: params.name };
+  if (params.parentId !== undefined) result["parent-id"] = params.parentId;
+  return result;
+}
+
+function toMochiUpdateDeckRequest(
+  params: UpdateDeckRequest
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  if (params.name !== undefined) result.name = params.name;
+  if (params.parentId !== undefined) result["parent-id"] = params.parentId;
+  if (params.trashed !== undefined) result["trashed?"] = params.trashed;
   return result;
 }
 
@@ -297,6 +359,8 @@ type ListCardsParams = z.infer<typeof ListCardsParamsSchema>;
 type ListDecksParams = z.infer<typeof ListDecksParamsSchema>;
 type CreateCardRequest = z.infer<typeof CreateCardRequestSchema>;
 type UpdateCardRequest = z.infer<typeof UpdateCardRequestSchema>;
+type CreateDeckRequest = z.infer<typeof CreateDeckRequestSchema>;
+type UpdateDeckRequest = z.infer<typeof UpdateDeckRequestSchema>;
 type GetDueCardsParams = z.infer<typeof GetDueCardsParamsSchema>;
 type CreateCardFromTemplateParams = z.infer<
   typeof CreateCardFromTemplateSchema
@@ -337,6 +401,12 @@ const ListCardsResponseSchema = z
       .optional()
       .describe("Pagination bookmark for fetching next page"),
     docs: z.array(CardSchema).describe("Array of cards"),
+    truncated: z
+      .boolean()
+      .optional()
+      .describe(
+        "Only set on subdeck-cascade queries (includeSubdecks: true). True when the card cap was reached and the result is incomplete."
+      ),
   })
   .strip();
 
@@ -447,6 +517,13 @@ const DeckSchema = z
     id: z.string().describe("Unique identifier for the deck"),
     sort: z.number().describe("Sort order of the deck"),
     name: z.string().describe("Display name of the deck"),
+    "parent-id": z
+      .string()
+      .optional()
+      .nullable()
+      .describe(
+        "ID of the parent deck this deck is nested under, if any. null/absent means it is a top-level deck. Use this to reconstruct the deck hierarchy."
+      ),
     "template-id": z
       .string()
       .optional()
@@ -490,6 +567,43 @@ const DueCardSchema = z
 const GetDueCardsResponseSchema = z.object({
   cards: z.array(DueCardSchema).describe("Array of cards due for review"),
 });
+
+/**
+ * Resolve a deck and all of its descendant subdecks (any depth) from the full
+ * deck set, by following `parent-id` links downward. The root is always
+ * included first. Cycle-guarded via a visited set, so malformed parent links
+ * can't loop forever. The caller is expected to pass an already-filtered list
+ * (e.g. from listAllDecks, which drops archived/trashed decks), so descent
+ * never reaches dead decks.
+ */
+export function descendantDeckIds(
+  allDecks: { id: string; "parent-id"?: string | null }[],
+  rootId: string
+): string[] {
+  const childrenByParent = new Map<string, string[]>();
+  for (const deck of allDecks) {
+    const parent = deck["parent-id"];
+    if (parent) {
+      const siblings = childrenByParent.get(parent) ?? [];
+      siblings.push(deck.id);
+      childrenByParent.set(parent, siblings);
+    }
+  }
+
+  const ordered: string[] = [];
+  const visited = new Set<string>();
+  const stack = [rootId];
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    ordered.push(id);
+    // Push children in reverse so they pop in their original order.
+    const children = childrenByParent.get(id) ?? [];
+    for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+  }
+  return ordered;
+}
 
 function getApiKey(): string {
   const apiKey = process.env.MOCHI_API_KEY;
@@ -709,11 +823,51 @@ export class MochiClient {
     return CreateCardResponseSchema.parse(response.data);
   }
 
+  async createDeck(
+    request: CreateDeckRequest
+  ): Promise<z.infer<typeof DeckSchema>> {
+    const mochiRequest = toMochiCreateDeckRequest(request);
+    const response = await this.api.post("/decks", mochiRequest);
+    return DeckSchema.parse(response.data);
+  }
+
+  async updateDeck(
+    deckId: string,
+    request: UpdateDeckRequest
+  ): Promise<z.infer<typeof DeckSchema>> {
+    const mochiRequest = toMochiUpdateDeckRequest(request);
+    const response = await this.api.post(
+      `/decks/${encodeURIComponent(deckId)}`,
+      mochiRequest
+    );
+    return DeckSchema.parse(response.data);
+  }
+
   async listDecks(params?: ListDecksParams): Promise<ListDecksResponse> {
     const validatedParams = params
       ? ListDecksParamsSchema.parse(params)
       : undefined;
-    const response = await this.api.get("/decks", { params: validatedParams });
+
+    // Scoped subtree query: resolve from the full (live) deck set rather than
+    // hitting the paginated /decks endpoint, which can't filter by parent.
+    if (validatedParams?.deckId) {
+      const all = await this.listAllDecks();
+      const wanted = validatedParams.includeSubdecks
+        ? new Set(descendantDeckIds(all, validatedParams.deckId))
+        : new Set([validatedParams.deckId]);
+      return {
+        bookmark: "",
+        docs: all.filter((deck) => wanted.has(deck.id)),
+      };
+    }
+
+    // Default: a single page from Mochi. Only `bookmark` is a real API param;
+    // our scoping params must never be forwarded as query string.
+    const response = await this.api.get("/decks", {
+      params: validatedParams?.bookmark
+        ? { bookmark: validatedParams.bookmark }
+        : undefined,
+    });
     const parsed = ListDecksResponseSchema.parse(response.data);
     return {
       bookmark: parsed.bookmark,
@@ -745,6 +899,17 @@ export class MochiClient {
     const validatedParams = params
       ? ListCardsParamsSchema.parse(params)
       : undefined;
+
+    if (validatedParams?.includeSubdecks) {
+      if (!validatedParams.deckId) {
+        throw new MochiError(
+          ["includeSubdecks requires deckId — it cascades a single deck's subtree."],
+          400
+        );
+      }
+      return this.listCardsDeep(validatedParams.deckId);
+    }
+
     const mochiParams = validatedParams
       ? toMochiListCardsParams(validatedParams)
       : undefined;
@@ -754,6 +919,40 @@ export class MochiClient {
     return {
       bookmark: parsed.bookmark,
       docs: parsed.docs.filter((card) => !card["archived?"] && !card["trashed?"]),
+    };
+  }
+
+  /**
+   * Aggregate every card in a deck and all of its descendant subdecks, grouped
+   * by deck (the target deck's cards first, then each subdeck's). Each subdeck
+   * is paginated fully; the whole walk is bounded by MAX_CASCADE_CARDS, and
+   * `truncated` reports whether that cap cut the result short. Mirrors the
+   * bounded-aggregate convention used by searchCards.
+   */
+  async listCardsDeep(deckId: string): Promise<ListCardsResponse> {
+    const all = await this.listAllDecks();
+    const deckIds = descendantDeckIds(all, deckId);
+    const docs: z.infer<typeof CardSchema>[] = [];
+    let truncated = false;
+
+    outer: for (const id of deckIds) {
+      let bookmark: string | undefined;
+      for (let page = 0; page < MAX_RESOURCE_PAGES; page++) {
+        const res = await this.listCards({ deckId: id, limit: 100, bookmark });
+        docs.push(...res.docs);
+        if (docs.length >= MAX_CASCADE_CARDS) {
+          truncated = true;
+          break outer;
+        }
+        if (!res.bookmark || res.docs.length === 0) break;
+        bookmark = res.bookmark;
+      }
+    }
+
+    return {
+      bookmark: null,
+      docs: truncated ? docs.slice(0, MAX_CASCADE_CARDS) : docs,
+      truncated,
     };
   }
 
@@ -1174,7 +1373,7 @@ function collectMutationResults(
 // Server setup
 const server = new McpServer({
   name: "mcp-server/mochi",
-  version: "2.6.0",
+  version: "2.7.0",
 });
 
 // Schema for update flashcard tool (combines cardId with update fields)
@@ -1196,6 +1395,23 @@ const UpdateFlashcardToolSchema = z.object({
     .describe(
       "Set to true to soft-delete (move to trash). This can be undone by setting to false."
     ),
+});
+
+// Schema for update deck tool (combines deckId with update fields)
+const UpdateDeckToolSchema = z.object({
+  deckId: z.string().describe("ID of the deck to update"),
+  name: z.string().min(1).optional().describe("New display name for the deck"),
+  parentId: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      "New parent deck ID to re-home this deck under as a subdeck. Pass null to move it to the top level."
+    ),
+  trashed: z
+    .boolean()
+    .optional()
+    .describe("Set true to soft-delete (move the deck to trash), false to restore."),
 });
 
 // Schema for delete flashcard tool
@@ -1545,7 +1761,7 @@ server.registerTool(
   {
     title: "List flashcards on Mochi",
     description:
-      "List flashcards, optionally filtered by deck. Returns paginated results.",
+      "List flashcards, optionally filtered by deck. Returns paginated results. Pass deckId alone for cards directly in that deck; add includeSubdecks: true to also pull cards from every nested subdeck (aggregated, bounded — check `truncated`).",
     inputSchema: ListCardsParamsSchema.shape,
     outputSchema: ListCardsResponseSchema,
     annotations: {
@@ -1600,7 +1816,8 @@ server.registerTool(
   "list_decks",
   {
     title: "List decks on Mochi",
-    description: "List all decks. Use to get deckId for other operations.",
+    description:
+      "List decks. Each deck carries `parent-id`, so you can reconstruct the hierarchy. No args returns all decks (paginated). Pass deckId to scope to one deck; add includeSubdecks: true to return that deck plus its full nested subtree — the way to enumerate a deck's subdecks.",
     inputSchema: ListDecksParamsSchema.shape,
     outputSchema: ListDecksResponseSchema,
     annotations: {
@@ -1613,6 +1830,63 @@ server.registerTool(
   async (args) => {
     try {
       const response = await getMochi().listDecks(args);
+      return {
+        content: [{ type: "text", text: JSON.stringify(response) }],
+        structuredContent: response,
+      };
+    } catch (error) {
+      return formatToolError(error);
+    }
+  }
+);
+
+server.registerTool(
+  "create_deck",
+  {
+    title: "Create deck on Mochi",
+    description:
+      "Create a new deck. Pass parentId to nest it under an existing deck as a subdeck; omit parentId for a top-level deck. Useful during an audit to add a missing subdeck before moving cards into it.",
+    inputSchema: CreateDeckRequestSchema.shape,
+    outputSchema: DeckSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async (args: z.infer<typeof CreateDeckRequestSchema>) => {
+    try {
+      const response = await getMochi().createDeck(args);
+      return {
+        content: [{ type: "text", text: JSON.stringify(response) }],
+        structuredContent: response,
+      };
+    } catch (error) {
+      return formatToolError(error);
+    }
+  }
+);
+
+server.registerTool(
+  "update_deck",
+  {
+    title: "Update deck on Mochi",
+    description:
+      "Update a deck's name, parent, or trashed state. Set parentId to re-home a deck under a new parent (or null to move it to the top level) — the cheapest way to fix a mis-nested or stray subdeck. Use trashed: true to soft-delete.",
+    inputSchema: UpdateDeckToolSchema.shape,
+    outputSchema: DeckSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+  async (args: z.infer<typeof UpdateDeckToolSchema>) => {
+    try {
+      const { deckId, ...updateArgs } = args;
+      const response = await getMochi().updateDeck(deckId, updateArgs);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
@@ -1723,7 +1997,11 @@ server.registerResource(
           uri: "mochi://decks",
           mimeType: "application/json",
           text: JSON.stringify(
-            decks.map((deck) => ({ id: deck.id, name: deck.name })),
+            decks.map((deck) => ({
+              id: deck.id,
+              name: deck.name,
+              "parent-id": deck["parent-id"] ?? null,
+            })),
             null,
             2
           ),

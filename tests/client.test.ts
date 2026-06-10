@@ -8,6 +8,7 @@ import {
   trigrams,
   jaccard,
   extractSnippet,
+  descendantDeckIds,
 } from "../src/index.js";
 
 // ---- Mock axios instance ----------------------------------------------------
@@ -531,5 +532,223 @@ describe("listAllDecks pagination", () => {
     });
     await client.listAllDecks(3);
     expect(api.get).toHaveBeenCalledTimes(3);
+  });
+});
+
+// ---- Deck hierarchy ---------------------------------------------------------
+
+describe("descendantDeckIds", () => {
+  const decks = [
+    { id: "root", "parent-id": null },
+    { id: "a", "parent-id": "root" },
+    { id: "b", "parent-id": "a" }, // grandchild
+    { id: "c", "parent-id": "root" },
+    { id: "other", "parent-id": null }, // unrelated top-level
+    { id: "other-child", "parent-id": "other" },
+  ];
+
+  it("includes the root first, then all descendants at any depth", () => {
+    const ids = descendantDeckIds(decks, "root");
+    expect(ids[0]).toBe("root");
+    expect(new Set(ids)).toEqual(new Set(["root", "a", "b", "c"]));
+  });
+
+  it("excludes unrelated subtrees", () => {
+    const ids = descendantDeckIds(decks, "root");
+    expect(ids).not.toContain("other");
+    expect(ids).not.toContain("other-child");
+  });
+
+  it("returns just the root when it has no children", () => {
+    expect(descendantDeckIds(decks, "b")).toEqual(["b"]);
+  });
+
+  it("returns the root id even when the deck set is empty", () => {
+    expect(descendantDeckIds([], "ghost")).toEqual(["ghost"]);
+  });
+
+  it("does not loop forever on a parent-id cycle", () => {
+    const cyclic = [
+      { id: "x", "parent-id": "y" },
+      { id: "y", "parent-id": "x" },
+    ];
+    const ids = descendantDeckIds(cyclic, "x");
+    expect(new Set(ids)).toEqual(new Set(["x", "y"]));
+  });
+});
+
+// ---- Deck schema parses parent-id ------------------------------------------
+
+describe("listDecks parent-id", () => {
+  it("surfaces parent-id from the API response", async () => {
+    const { client } = newClient({
+      get: () => ({
+        data: {
+          bookmark: "",
+          docs: [
+            { id: "p", sort: 1, name: "Parent" },
+            { id: "c", sort: 2, name: "Child", "parent-id": "p" },
+          ],
+        },
+      }),
+    });
+    const res = await client.listDecks();
+    expect(res.docs.find((d) => d.id === "c")?.["parent-id"]).toBe("p");
+  });
+});
+
+// ---- Scoped deck subtree queries -------------------------------------------
+
+describe("listDecks scoped to a subtree", () => {
+  const deckPage = {
+    bookmark: "",
+    docs: [
+      { id: "unit", sort: 1, name: "Python" },
+      { id: "sub1", sort: 2, name: "Functions", "parent-id": "unit" },
+      { id: "sub2", sort: 3, name: "OOP", "parent-id": "unit" },
+      { id: "nested", sort: 4, name: "Dataclasses", "parent-id": "sub2" },
+      { id: "stray", sort: 5, name: "Unrelated" },
+    ],
+  };
+
+  it("returns just the deck when includeSubdecks is not set", async () => {
+    const { client } = newClient({ get: () => ({ data: deckPage }) });
+    const res = await client.listDecks({ deckId: "unit" });
+    expect(res.docs.map((d) => d.id)).toEqual(["unit"]);
+    expect(res.bookmark).toBe("");
+  });
+
+  it("returns the deck plus its full nested subtree with includeSubdecks", async () => {
+    const { client } = newClient({ get: () => ({ data: deckPage }) });
+    const res = await client.listDecks({
+      deckId: "unit",
+      includeSubdecks: true,
+    });
+    expect(new Set(res.docs.map((d) => d.id))).toEqual(
+      new Set(["unit", "sub1", "sub2", "nested"])
+    );
+    expect(res.docs.map((d) => d.id)).not.toContain("stray");
+  });
+
+  it("never forwards scoping params to the /decks query string", async () => {
+    const { client, api } = newClient({ get: () => ({ data: deckPage }) });
+    await client.listDecks({ deckId: "unit", includeSubdecks: true });
+    for (const call of api.get.mock.calls) {
+      const params = call[1]?.params ?? {};
+      expect(params).not.toHaveProperty("deckId");
+      expect(params).not.toHaveProperty("includeSubdecks");
+    }
+  });
+});
+
+// ---- Card cascade across subdecks ------------------------------------------
+
+describe("listCards includeSubdecks cascade", () => {
+  const decks = {
+    bookmark: "",
+    docs: [
+      { id: "unit", sort: 1, name: "Python" },
+      { id: "sub", sort: 2, name: "Functions", "parent-id": "unit" },
+      { id: "stray", sort: 3, name: "Unrelated" },
+    ],
+  };
+
+  it("aggregates cards from the deck and its subdecks, excluding unrelated decks", async () => {
+    const { client } = newClient({
+      get: (url, config) => {
+        if (url === "/decks") return { data: decks };
+        const deckId = config?.params?.["deck-id"];
+        const byDeck: Record<string, any[]> = {
+          unit: [sampleCard({ id: "u1", "deck-id": "unit" })],
+          sub: [sampleCard({ id: "s1", "deck-id": "sub" })],
+          stray: [sampleCard({ id: "x1", "deck-id": "stray" })],
+        };
+        return { data: { bookmark: "", docs: byDeck[deckId] ?? [] } };
+      },
+    });
+    const res = await client.listCards({
+      deckId: "unit",
+      includeSubdecks: true,
+    });
+    expect(res.docs.map((c) => c.id).sort()).toEqual(["s1", "u1"]);
+    expect(res.truncated).toBe(false);
+    expect(res.bookmark).toBeNull();
+  });
+
+  it("throws when includeSubdecks is set without a deckId", async () => {
+    const { client, api } = newClient();
+    await expect(
+      client.listCards({ includeSubdecks: true })
+    ).rejects.toMatchObject({ name: "MochiError", statusCode: 400 });
+    expect(api.get).not.toHaveBeenCalled();
+  });
+
+  it("sets truncated when the card cap is exceeded", async () => {
+    const { client } = newClient({
+      get: (url) => {
+        if (url === "/decks")
+          return { data: { bookmark: "", docs: [{ id: "unit", sort: 1, name: "U" }] } };
+        // Always a full page with a bookmark, so the walk keeps paging.
+        const docs = Array.from({ length: 100 }, (_, i) =>
+          sampleCard({ id: `c-${Math.random()}-${i}`, "deck-id": "unit" })
+        );
+        return { data: { bookmark: "next", docs } };
+      },
+    });
+    const res = await client.listCards({
+      deckId: "unit",
+      includeSubdecks: true,
+    });
+    expect(res.truncated).toBe(true);
+    expect(res.docs).toHaveLength(2000);
+  });
+});
+
+// ---- Deck create / update ---------------------------------------------------
+
+describe("createDeck", () => {
+  it("maps parentId to parent-id and posts to /decks", async () => {
+    const { client, api } = newClient({
+      post: () => ({ data: { id: "new", sort: 1, name: "Sub", "parent-id": "p" } }),
+    });
+    const deck = await client.createDeck({ name: "Sub", parentId: "p" });
+    expect(api.post.mock.calls[0][0]).toBe("/decks");
+    expect(api.post.mock.calls[0][1]).toEqual({ name: "Sub", "parent-id": "p" });
+    expect(deck.id).toBe("new");
+  });
+
+  it("omits parent-id for a top-level deck", async () => {
+    const { client, api } = newClient({
+      post: () => ({ data: { id: "new", sort: 1, name: "Top" } }),
+    });
+    await client.createDeck({ name: "Top" });
+    expect(api.post.mock.calls[0][1]).toEqual({ name: "Top" });
+  });
+});
+
+describe("updateDeck", () => {
+  it("re-homes a deck and encodes the deckId", async () => {
+    const { client, api } = newClient({
+      post: () => ({ data: { id: "d/1", sort: 1, name: "X", "parent-id": "new" } }),
+    });
+    await client.updateDeck("d/1", { parentId: "new" });
+    expect(api.post.mock.calls[0][0]).toBe("/decks/d%2F1");
+    expect(api.post.mock.calls[0][1]).toEqual({ "parent-id": "new" });
+  });
+
+  it("passes null parent-id to move a deck to the top level", async () => {
+    const { client, api } = newClient({
+      post: () => ({ data: { id: "d1", sort: 1, name: "X" } }),
+    });
+    await client.updateDeck("d1", { parentId: null });
+    expect(api.post.mock.calls[0][1]).toEqual({ "parent-id": null });
+  });
+
+  it("maps trashed to the trashed? flag", async () => {
+    const { client, api } = newClient({
+      post: () => ({ data: { id: "d1", sort: 1, name: "X" } }),
+    });
+    await client.updateDeck("d1", { trashed: true });
+    expect(api.post.mock.calls[0][1]).toEqual({ "trashed?": true });
   });
 });

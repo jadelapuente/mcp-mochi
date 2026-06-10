@@ -75,8 +75,10 @@ Add the following to your `claude_desktop_config.json`:
 | `mochi_delete_flashcard` | Permanently delete a flashcard and its attachments (cannot be undone) |
 | `mochi_archive_flashcard` | Archive or unarchive a flashcard |
 | `mochi_add_attachment` | Add an attachment (image, audio, etc.) to a card using base64 data |
-| `mochi_list_flashcards` | List flashcards, optionally filtered by deck |
-| `mochi_list_decks` | List all decks |
+| `mochi_list_flashcards` | List flashcards, optionally filtered by deck. Pass `includeSubdecks: true` with a `deckId` to also pull cards from every nested subdeck |
+| `mochi_list_decks` | List decks (each with `parent-id` for hierarchy). Scope to a deck with `deckId`, and add `includeSubdecks: true` to return its full nested subtree |
+| `mochi_create_deck` | Create a deck, optionally nested under a parent via `parentId` |
+| `mochi_update_deck` | Rename a deck, re-home it under a new `parentId` (or `null` for top level), or soft-delete with `trashed` |
 | `mochi_list_templates` | List all templates with their field definitions |
 | `mochi_get_template` | Get a single template by ID |
 | `mochi_get_due_cards` | Get flashcards due for review |
