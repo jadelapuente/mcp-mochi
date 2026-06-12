@@ -704,6 +704,63 @@ describe("listCards includeSubdecks cascade", () => {
   });
 });
 
+// ---- Default card list auto-pagination -------------------------------------
+
+describe("listCards auto-paginates by default", () => {
+  it("follows bookmarks to exhaustion and returns a null bookmark", async () => {
+    const pages: any[] = [
+      { bookmark: "b1", docs: [sampleCard({ id: "c1" })] },
+      { bookmark: "b2", docs: [sampleCard({ id: "c2" })] },
+      // Mochi keeps the bookmark truthy even on the empty final page.
+      { bookmark: "b3", docs: [] },
+    ];
+    let i = 0;
+    const { client, api } = newClient({
+      get: () => ({ data: pages[i++] }),
+    });
+
+    const res = await client.listCards();
+    expect(res.docs.map((c) => c.id)).toEqual(["c1", "c2"]);
+    expect(res.bookmark).toBeNull();
+    expect(res.truncated).toBe(false);
+    expect(api.get).toHaveBeenCalledTimes(3);
+  });
+
+  it("forwards the bookmark cursor on each follow-up page", async () => {
+    const seen: (string | undefined)[] = [];
+    const pages: any[] = [
+      { bookmark: "b1", docs: [sampleCard({ id: "c1" })] },
+      { bookmark: "", docs: [] },
+    ];
+    let i = 0;
+    const { client } = newClient({
+      get: (_url, config) => {
+        seen.push(config?.params?.bookmark);
+        return { data: pages[i++] };
+      },
+    });
+
+    await client.listCards({ deckId: "unit" });
+    expect(seen).toEqual([undefined, "b1"]);
+  });
+
+  it("sets truncated when the card cap is exceeded", async () => {
+    const { client } = newClient({
+      get: () => {
+        // Always a full page with a bookmark, so the walk keeps paging.
+        const docs = Array.from({ length: 100 }, (_, i) =>
+          sampleCard({ id: `c-${Math.random()}-${i}` })
+        );
+        return { data: { bookmark: "next", docs } };
+      },
+    });
+
+    const res = await client.listCards({ deckId: "unit" });
+    expect(res.truncated).toBe(true);
+    expect(res.docs).toHaveLength(2000);
+  });
+});
+
 // ---- Deck create / update ---------------------------------------------------
 
 describe("createDeck", () => {

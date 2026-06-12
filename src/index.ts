@@ -147,6 +147,17 @@ const ListCardsParamsSchema = z.object({
     ),
 });
 
+// Model-facing input for list_flashcards. The tool auto-paginates, so it
+// intentionally omits `limit`/`bookmark` (those live on ListCardsParamsSchema
+// for the internal single-page primitive, fetchCardsPage).
+const ListFlashcardsToolSchema = z.object({
+  deckId: z
+    .string()
+    .optional()
+    .describe("Scope results to a single deck. Omit to list every card."),
+  includeSubdecks: ListCardsParamsSchema.shape.includeSubdecks,
+});
+
 const ListTemplatesParamsSchema = z.object({
   bookmark: z
     .string()
@@ -226,7 +237,7 @@ const CreateCardsFromTemplateRequestSchema = z.object({
 
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB decoded
 const MAX_RESOURCE_PAGES = 50; // Safety cap when paginating resources
-const MAX_CASCADE_CARDS = 2000; // Safety cap when aggregating cards across a subdeck subtree
+const MAX_AGGREGATE_CARDS = 2000; // Safety cap when auto-paginating a card list (default list_flashcards and subdeck cascade)
 
 // Internal type for adding attachments (used by addAttachment method)
 interface AddAttachmentRequest {
@@ -399,13 +410,15 @@ const ListCardsResponseSchema = z
     bookmark: z.string()
       .nullable()
       .optional()
-      .describe("Pagination bookmark for fetching next page"),
+      .describe(
+        "Always null from list_flashcards — results are fully auto-paginated, so there is no next page to fetch."
+      ),
     docs: z.array(CardSchema).describe("Array of cards"),
     truncated: z
       .boolean()
       .optional()
       .describe(
-        "Only set on subdeck-cascade queries (includeSubdecks: true). True when the card cap was reached and the result is incomplete."
+        "True when the card cap was reached and the result is incomplete (some cards omitted). Applies to both the default list and subdeck-cascade queries (includeSubdecks: true)."
       ),
   })
   .strip();
@@ -895,6 +908,13 @@ export class MochiClient {
     return all.sort((a, b) => a.sort - b.sort);
   }
 
+  /**
+   * What list_flashcards returns: the complete set of cards, auto-paginated so
+   * the caller never deals with bookmarks. Mochi keeps the bookmark truthy even
+   * on the final/empty page, so a single page can't tell a consumer it's done;
+   * we walk to exhaustion here instead. Bounded by MAX_AGGREGATE_CARDS, with
+   * `truncated` reporting whether the cap cut the result short.
+   */
   async listCards(params?: ListCardsParams): Promise<ListCardsResponse> {
     const validatedParams = params
       ? ListCardsParamsSchema.parse(params)
@@ -910,6 +930,46 @@ export class MochiClient {
       return this.listCardsDeep(validatedParams.deckId);
     }
 
+    return this.listAllCards(validatedParams?.deckId);
+  }
+
+  /**
+   * Walk every page for a single (deckId-scoped or account-wide) card list and
+   * return the full set, bounded by MAX_AGGREGATE_CARDS. Mirrors the
+   * bounded-aggregate convention used by searchCards and listCardsDeep.
+   */
+  async listAllCards(deckId?: string): Promise<ListCardsResponse> {
+    const docs: z.infer<typeof CardSchema>[] = [];
+    let bookmark: string | undefined;
+    let truncated = false;
+
+    for (let page = 0; page < MAX_RESOURCE_PAGES; page++) {
+      const res = await this.fetchCardsPage({ deckId, limit: 100, bookmark });
+      docs.push(...res.docs);
+      if (docs.length >= MAX_AGGREGATE_CARDS) {
+        truncated = true;
+        break;
+      }
+      if (!res.bookmark || res.docs.length === 0) break;
+      bookmark = res.bookmark;
+    }
+
+    return {
+      bookmark: null,
+      docs: truncated ? docs.slice(0, MAX_AGGREGATE_CARDS) : docs,
+      truncated,
+    };
+  }
+
+  /**
+   * Single raw page from Mochi's /cards endpoint, with archived/trashed cards
+   * filtered out. The low-level primitive behind every card walk; the bookmark
+   * is passed through verbatim for the caller to continue paging.
+   */
+  async fetchCardsPage(params?: ListCardsParams): Promise<ListCardsResponse> {
+    const validatedParams = params
+      ? ListCardsParamsSchema.parse(params)
+      : undefined;
     const mochiParams = validatedParams
       ? toMochiListCardsParams(validatedParams)
       : undefined;
@@ -938,9 +998,9 @@ export class MochiClient {
     outer: for (const id of deckIds) {
       let bookmark: string | undefined;
       for (let page = 0; page < MAX_RESOURCE_PAGES; page++) {
-        const res = await this.listCards({ deckId: id, limit: 100, bookmark });
+        const res = await this.fetchCardsPage({ deckId: id, limit: 100, bookmark });
         docs.push(...res.docs);
-        if (docs.length >= MAX_CASCADE_CARDS) {
+        if (docs.length >= MAX_AGGREGATE_CARDS) {
           truncated = true;
           break outer;
         }
@@ -951,7 +1011,7 @@ export class MochiClient {
 
     return {
       bookmark: null,
-      docs: truncated ? docs.slice(0, MAX_CASCADE_CARDS) : docs,
+      docs: truncated ? docs.slice(0, MAX_AGGREGATE_CARDS) : docs,
       truncated,
     };
   }
@@ -972,7 +1032,7 @@ export class MochiClient {
 
     while (scanned < maxScanned) {
       const remainingScan = maxScanned - scanned;
-      const page = await this.listCards({
+      const page = await this.fetchCardsPage({
         deckId,
         limit: Math.min(100, Math.max(1, remainingScan)),
         bookmark,
@@ -1761,8 +1821,8 @@ server.registerTool(
   {
     title: "List flashcards on Mochi",
     description:
-      "List flashcards, optionally filtered by deck. Returns paginated results. Pass deckId alone for cards directly in that deck; add includeSubdecks: true to also pull cards from every nested subdeck (aggregated, bounded — check `truncated`).",
-    inputSchema: ListCardsParamsSchema.shape,
+      "List flashcards, optionally filtered by deck. Returns the complete set of cards — results are auto-paginated for you, so there are no bookmarks to follow. The result is bounded by a safety cap: check `truncated` in the response (true means the cap was hit and some cards are omitted). Pass deckId alone for cards directly in that deck; add includeSubdecks: true to also pull cards from every nested subdeck.",
+    inputSchema: ListFlashcardsToolSchema.shape,
     outputSchema: ListCardsResponseSchema,
     annotations: {
       readOnlyHint: true,
