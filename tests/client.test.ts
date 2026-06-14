@@ -9,6 +9,7 @@ import {
   jaccard,
   extractSnippet,
   descendantDeckIds,
+  pickChangedFields,
 } from "../src/index.js";
 
 // ---- Mock axios instance ----------------------------------------------------
@@ -126,6 +127,239 @@ describe("extractSnippet", () => {
   it("omits ellipses at start/end of content", () => {
     const snippet = extractSnippet("short content", 0, 200);
     expect(snippet).toBe("short content");
+  });
+});
+
+// ---- update_flashcard changed-only confirmation -----------------------------
+
+describe("pickChangedFields", () => {
+  it("returns only the id when nothing was requested to change", () => {
+    expect(pickChangedFields({}, sampleCard() as any)).toEqual({ id: "card-1" });
+  });
+
+  it("echoes only the changed fields, sourced from the server response", () => {
+    const card = sampleCard({
+      id: "c1",
+      content: "stored content\n---\nstored answer",
+      "deck-id": "deck-new",
+    });
+    const changed = pickChangedFields(
+      { content: "ignored input", deckId: "ignored input" } as any,
+      card as any
+    );
+    expect(changed).toEqual({
+      id: "c1",
+      content: "stored content\n---\nstored answer",
+      "deck-id": "deck-new",
+    });
+  });
+
+  it("does not leak fields that were not part of the update", () => {
+    const card = sampleCard({ id: "c1", "deck-id": "deck-new" });
+    const changed = pickChangedFields({ deckId: "deck-new" } as any, card as any);
+    expect(changed).toEqual({ id: "c1", "deck-id": "deck-new" });
+    expect(changed).not.toHaveProperty("content");
+    expect(changed).not.toHaveProperty("name");
+  });
+
+  it("reports trashed as a boolean derived from the response", () => {
+    const trashed = pickChangedFields(
+      { trashed: true } as any,
+      sampleCard({ "trashed?": { date: "2026-06-14T00:00:00.000Z" } }) as any
+    );
+    expect(trashed).toEqual({ id: "card-1", trashed: true });
+
+    const restored = pickChangedFields(
+      { trashed: false } as any,
+      sampleCard() as any
+    );
+    expect(restored).toEqual({ id: "card-1", trashed: false });
+  });
+
+  it("confirms templateId, normalizing an absent template-id to null", () => {
+    const withTemplate = pickChangedFields(
+      { templateId: "t1" } as any,
+      sampleCard({ "template-id": "t1" }) as any
+    );
+    expect(withTemplate).toEqual({ id: "card-1", "template-id": "t1" });
+
+    const cleared = pickChangedFields(
+      { templateId: "t1" } as any,
+      sampleCard() as any
+    );
+    expect(cleared).toEqual({ id: "card-1", "template-id": null });
+  });
+});
+
+// ---- Batch mutation result is a count + itemized failures ------------------
+
+describe("updateCards batch result", () => {
+  it("returns a success count and itemizes only the failures", async () => {
+    const { client } = newClient({
+      post: (url) => {
+        if (url === "/cards/bad") throw new MochiError(["boom"], 500);
+        return { data: sampleCard() };
+      },
+    });
+    const res = await client.updateCards([
+      { cardId: "good1", content: "x" },
+      { cardId: "bad", content: "y" },
+      { cardId: "good2", deckId: "d" },
+    ]);
+    expect(res.succeeded).toBe(2);
+    expect(res.failed).toHaveLength(1);
+    expect(res.failed[0]).toMatchObject({ index: 1, cardId: "bad" });
+    expect(res.failed[0].error).toContain("boom");
+  });
+
+  it("reports an empty failures array when everything succeeds", async () => {
+    const { client } = newClient({ post: () => ({ data: sampleCard() }) });
+    const res = await client.deleteCards([
+      { cardId: "a" },
+      { cardId: "b" },
+    ]);
+    // deleteCards uses DELETE, not POST; default mock returns {} which is fine.
+    expect(res.succeeded).toBe(2);
+    expect(res.failed).toEqual([]);
+  });
+});
+
+// ---- Degraded cards don't blind the whole page -----------------------------
+
+describe("CardSchema tolerates a null fields value", () => {
+  it("lists a deck even when one card has fields: null", async () => {
+    const { client } = newClient({
+      get: () => ({
+        data: {
+          bookmark: "",
+          docs: [
+            sampleCard({ id: "ok" }),
+            sampleCard({ id: "broken", fields: null }),
+          ],
+        },
+      }),
+    });
+    const res = await client.listCards();
+    // Without nullable fields, this whole parse throws and the deck can't list.
+    expect(res.docs.map((c) => c.id).sort()).toEqual(["broken", "ok"]);
+  });
+
+  it("search scans past a card with fields: null instead of erroring", async () => {
+    const { client } = newClient({
+      get: () => ({
+        data: {
+          bookmark: "",
+          docs: [
+            sampleCard({ id: "hit", content: "derivative of x" }),
+            sampleCard({ id: "broken", fields: null }),
+          ],
+        },
+      }),
+    });
+    const res = await client.searchCards({ query: "derivative" });
+    expect(res.matches.map((m) => m.id)).toEqual(["hit"]);
+    expect(res.scanned).toBe(2);
+  });
+
+  it("keeps a card whose content is null (still listable for repair)", async () => {
+    const { client } = newClient({
+      get: () => ({
+        data: {
+          bookmark: "",
+          docs: [sampleCard({ id: "degraded", content: null, fields: null })],
+        },
+      }),
+    });
+    const res = await client.listCards();
+    expect(res.docs.map((c) => c.id)).toEqual(["degraded"]);
+    expect(res.malformed).toBeUndefined();
+  });
+});
+
+// ---- Per-card resilience: one bad card can't blind a deck -------------------
+
+describe("fetchCardsPage quarantines unparseable cards", () => {
+  it("sets aside a malformed card and still returns the good ones", async () => {
+    const { client } = newClient({
+      get: () => ({
+        data: {
+          bookmark: "",
+          docs: [
+            sampleCard({ id: "good" }),
+            // deck-id is a number — violates CardSchema, can't be salvaged
+            { id: "bad", content: "x", name: "n", tags: [], "deck-id": 123 },
+          ],
+        },
+      }),
+    });
+    const res = await client.listCards();
+    expect(res.docs.map((c) => c.id)).toEqual(["good"]);
+    expect(res.malformed).toHaveLength(1);
+    expect(res.malformed![0].id).toBe("bad");
+    expect(res.malformed![0].error).toContain("deck-id");
+  });
+
+  it("reports (unknown id) when even the id can't be read", async () => {
+    const { client } = newClient({
+      get: () => ({
+        data: { bookmark: "", docs: [{ name: "no id here" }] },
+      }),
+    });
+    const res = await client.listCards();
+    expect(res.docs).toHaveLength(0);
+    expect(res.malformed![0].id).toBe("(unknown id)");
+  });
+
+  it("does not treat an all-malformed page as the end of the list", async () => {
+    const pages: any[] = [
+      // Page 1: only a malformed card, but a live bookmark — must keep paging.
+      { bookmark: "b1", docs: [{ id: "bad", "deck-id": 1 }] },
+      { bookmark: "b2", docs: [sampleCard({ id: "good" })] },
+      { bookmark: "", docs: [] },
+    ];
+    let i = 0;
+    const { client, api } = newClient({ get: () => ({ data: pages[i++] }) });
+    const res = await client.listCards();
+    expect(res.docs.map((c) => c.id)).toEqual(["good"]);
+    expect(res.malformed!.map((m) => m.id)).toEqual(["bad"]);
+    expect(api.get).toHaveBeenCalledTimes(3);
+  });
+});
+
+// ---- Bulk same-change update ------------------------------------------------
+
+describe("updateCardsBulk", () => {
+  it("applies one shared patch to every id and dedupes", async () => {
+    const { client, api } = newClient({ post: () => ({ data: sampleCard() }) });
+    const res = await client.updateCardsBulk(["a", "b", "a"], { deckId: "X" });
+    expect(res.succeeded).toBe(2); // "a" collapsed
+    expect(res.failed).toEqual([]);
+    // One POST per unique id, each carrying the shared change.
+    expect(api.post).toHaveBeenCalledTimes(2);
+    const urls = api.post.mock.calls.map((c) => c[0]).sort();
+    expect(urls).toEqual(["/cards/a", "/cards/b"]);
+    expect(api.post.mock.calls.every((c) => c[1]["deck-id"] === "X")).toBe(true);
+  });
+
+  it("itemizes only the failures, keyed by card id", async () => {
+    const { client } = newClient({
+      post: (url) => {
+        if (url === "/cards/b") throw new MochiError(["boom"], 500);
+        return { data: sampleCard() };
+      },
+    });
+    const res = await client.updateCardsBulk(["a", "b", "c"], { trashed: true });
+    expect(res.succeeded).toBe(2);
+    expect(res.failed).toHaveLength(1);
+    expect(res.failed[0]).toMatchObject({ cardId: "b" });
+  });
+
+  it("refuses a no-op patch before making any request", async () => {
+    const { client, api } = newClient();
+    await expect(
+      client.updateCardsBulk(["a", "b"], {})
+    ).rejects.toMatchObject({ name: "MochiError", statusCode: 400 });
+    expect(api.post).not.toHaveBeenCalled();
   });
 });
 

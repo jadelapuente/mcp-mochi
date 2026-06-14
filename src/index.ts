@@ -386,18 +386,25 @@ const CardSchema = z
       .describe("Array of tags associated with the card"),
     content: z
       .string()
+      .nullable()
       .describe(
-        'Markdown content of the card. Separate the question and answer with "---"'
+        'Markdown content of the card. Separate the question and answer with "---". Can be null for a degraded/broken card — tolerated so one bad card does not fail the whole page.'
       ),
     name: z.string().describe("Display name of the card"),
     "deck-id": z.string().describe("ID of the deck containing the card"),
+    "template-id": z
+      .string()
+      .optional()
+      .nullable()
+      .describe("ID of the template this card uses, if any"),
     "archived?": z.boolean().optional().nullable(),
     "trashed?": z.object({ date: z.string() }).optional().nullable(),
     fields: z
       .record(z.string(), z.unknown())
       .optional()
+      .nullable()
       .describe(
-        "Map of field IDs to field values. Need to match the field IDs in the template"
+        "Map of field IDs to field values. Need to match the field IDs in the template. Mochi can return null for a degraded/broken card — tolerated here so one bad card doesn't fail the whole page."
       ),
   })
   .strip();
@@ -420,12 +427,50 @@ const ListCardsResponseSchema = z
       .describe(
         "True when the card cap was reached and the result is incomplete (some cards omitted). Applies to both the default list and subdeck-cascade queries (includeSubdecks: true)."
       ),
+    malformed: z
+      .array(
+        z.object({
+          id: z
+            .string()
+            .describe("Best-effort ID of the card that failed to parse"),
+          error: z.string().describe("Why the card failed schema validation"),
+        })
+      )
+      .optional()
+      .describe(
+        "Cards Mochi returned that failed schema validation and were set aside so the rest of the page could still load. Omitted from docs; repair them (re-save in Mochi, or update_flashcard) to make them listable. Absent when every card parsed."
+      ),
   })
   .strip();
 
 type CreateCardResponse = z.infer<typeof CreateCardResponseSchema>;
 type ListDecksResponse = z.infer<typeof ListDecksResponseSchema>;
 type ListCardsResponse = z.infer<typeof ListCardsResponseSchema>;
+
+// Loose envelope for a raw /cards page: validate the wrapper, but keep each
+// card as `unknown` so a single corrupt card can be quarantined instead of
+// throwing out the whole page (and blinding the deck).
+const CardsPageEnvelopeSchema = z
+  .object({
+    bookmark: z.string().nullable().optional(),
+    docs: z.array(z.unknown()),
+  })
+  .strip();
+
+type CardMalformedEntry = { id: string; error: string };
+
+/** Best-effort id for a card that failed full validation, for the malformed report. */
+function extractCardId(raw: unknown): string {
+  const parsed = z.object({ id: z.string() }).safeParse(raw);
+  return parsed.success ? parsed.data.id : "(unknown id)";
+}
+
+/** Flatten Zod issues into a compact "path: message; …" string. */
+function summarizeCardError(error: z.ZodError): string {
+  return error.issues
+    .map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`)
+    .join("; ");
+}
 
 const SlimCreatedCardSchema = z.object({
   id: z.string().describe("Mochi card ID"),
@@ -940,17 +985,22 @@ export class MochiClient {
    */
   async listAllCards(deckId?: string): Promise<ListCardsResponse> {
     const docs: z.infer<typeof CardSchema>[] = [];
+    const malformed: CardMalformedEntry[] = [];
     let bookmark: string | undefined;
     let truncated = false;
 
     for (let page = 0; page < MAX_RESOURCE_PAGES; page++) {
       const res = await this.fetchCardsPage({ deckId, limit: 100, bookmark });
       docs.push(...res.docs);
+      if (res.malformed) malformed.push(...res.malformed);
       if (docs.length >= MAX_AGGREGATE_CARDS) {
         truncated = true;
         break;
       }
-      if (!res.bookmark || res.docs.length === 0) break;
+      // A page with no live cards but some malformed ones is NOT the end —
+      // keep paging. Only a truly empty page (or no bookmark) stops the walk.
+      const pageEmpty = res.docs.length === 0 && (res.malformed?.length ?? 0) === 0;
+      if (!res.bookmark || pageEmpty) break;
       bookmark = res.bookmark;
     }
 
@@ -958,6 +1008,7 @@ export class MochiClient {
       bookmark: null,
       docs: truncated ? docs.slice(0, MAX_AGGREGATE_CARDS) : docs,
       truncated,
+      ...(malformed.length > 0 ? { malformed } : {}),
     };
   }
 
@@ -974,11 +1025,30 @@ export class MochiClient {
       ? toMochiListCardsParams(validatedParams)
       : undefined;
     const response = await this.api.get("/cards", { params: mochiParams });
-    const parsed = ListCardsResponseSchema.parse(response.data);
+
+    // Validate the envelope, then each card on its own: a single corrupt card
+    // is quarantined in `malformed` (with its id) rather than throwing out the
+    // whole page. Good, live cards pass through; archived/trashed are dropped.
+    const envelope = CardsPageEnvelopeSchema.parse(response.data);
+    const docs: z.infer<typeof CardSchema>[] = [];
+    const malformed: CardMalformedEntry[] = [];
+    for (const raw of envelope.docs) {
+      const result = CardSchema.safeParse(raw);
+      if (!result.success) {
+        malformed.push({
+          id: extractCardId(raw),
+          error: summarizeCardError(result.error),
+        });
+        continue;
+      }
+      const card = result.data;
+      if (!card["archived?"] && !card["trashed?"]) docs.push(card);
+    }
 
     return {
-      bookmark: parsed.bookmark,
-      docs: parsed.docs.filter((card) => !card["archived?"] && !card["trashed?"]),
+      bookmark: envelope.bookmark,
+      docs,
+      ...(malformed.length > 0 ? { malformed } : {}),
     };
   }
 
@@ -993,6 +1063,7 @@ export class MochiClient {
     const all = await this.listAllDecks();
     const deckIds = descendantDeckIds(all, deckId);
     const docs: z.infer<typeof CardSchema>[] = [];
+    const malformed: CardMalformedEntry[] = [];
     let truncated = false;
 
     outer: for (const id of deckIds) {
@@ -1000,11 +1071,13 @@ export class MochiClient {
       for (let page = 0; page < MAX_RESOURCE_PAGES; page++) {
         const res = await this.fetchCardsPage({ deckId: id, limit: 100, bookmark });
         docs.push(...res.docs);
+        if (res.malformed) malformed.push(...res.malformed);
         if (docs.length >= MAX_AGGREGATE_CARDS) {
           truncated = true;
           break outer;
         }
-        if (!res.bookmark || res.docs.length === 0) break;
+        const pageEmpty = res.docs.length === 0 && (res.malformed?.length ?? 0) === 0;
+        if (!res.bookmark || pageEmpty) break;
         bookmark = res.bookmark;
       }
     }
@@ -1013,6 +1086,7 @@ export class MochiClient {
       bookmark: null,
       docs: truncated ? docs.slice(0, MAX_AGGREGATE_CARDS) : docs,
       truncated,
+      ...(malformed.length > 0 ? { malformed } : {}),
     };
   }
 
@@ -1368,6 +1442,31 @@ export class MochiClient {
     return collectMutationResults(items, settled);
   }
 
+  /**
+   * Apply one identical patch to many cards. Same fan-out as updateCards, but
+   * the caller sends the change once instead of repeating it per id. Duplicate
+   * ids are collapsed so we never fire a redundant request for the same card.
+   */
+  async updateCardsBulk(
+    cardIds: string[],
+    patch: Omit<BatchUpdateItem, "cardId">
+  ): Promise<BatchMutationResult> {
+    // Refuse a no-op patch: without a change, this would fire one empty update
+    // per card — pure cost, no effect. Mirrors the empty-content guard on create.
+    const hasChange = Object.values(patch).some((v) => v !== undefined);
+    if (!hasChange) {
+      throw new MochiError(
+        [
+          "No change provided. Set at least one of deckId, templateId, or trashed to apply across the cards.",
+        ],
+        400
+      );
+    }
+    const uniqueIds = Array.from(new Set(cardIds));
+    const items = uniqueIds.map((cardId) => ({ cardId, ...patch }));
+    return this.updateCards(items);
+  }
+
   async archiveCards(
     items: BatchArchiveItem[]
   ): Promise<BatchMutationResult> {
@@ -1391,8 +1490,11 @@ export class MochiClient {
 
 const BatchMutationResultSchema = z.object({
   succeeded: z
-    .array(z.object({ cardId: z.string() }))
-    .describe("IDs of cards that were mutated successfully"),
+    .number()
+    .int()
+    .describe(
+      "Count of cards mutated successfully. The caller supplied the ids, so success is just a tally — only failures are itemized."
+    ),
   failed: z
     .array(
       z.object({
@@ -1401,7 +1503,7 @@ const BatchMutationResultSchema = z.object({
         error: z.string().describe("Error message"),
       })
     )
-    .describe("Cards that failed to mutate"),
+    .describe("Cards that failed to mutate. Empty when everything succeeded."),
 });
 type BatchMutationResult = z.infer<typeof BatchMutationResultSchema>;
 
@@ -1413,11 +1515,11 @@ function collectMutationResults(
   inputs: HasCardId[],
   settled: PromiseSettledResult<string>[]
 ): BatchMutationResult {
-  const succeeded: { cardId: string }[] = [];
+  let succeeded = 0;
   const failed: BatchMutationResult["failed"] = [];
   settled.forEach((r, i) => {
     if (r.status === "fulfilled") {
-      succeeded.push({ cardId: r.value });
+      succeeded++;
     } else {
       const err = r.reason;
       failed.push({
@@ -1433,7 +1535,7 @@ function collectMutationResults(
 // Server setup
 const server = new McpServer({
   name: "mcp-server/mochi",
-  version: "2.7.0",
+  version: "2.8.0",
 });
 
 // Schema for update flashcard tool (combines cardId with update fields)
@@ -1456,6 +1558,61 @@ const UpdateFlashcardToolSchema = z.object({
       "Set to true to soft-delete (move to trash). This can be undone by setting to false."
     ),
 });
+
+// Slim confirmation returned by update_flashcard: the card id plus only the
+// fields the caller asked to change, read back from Mochi's response so the
+// values reflect what was actually stored. Lets a caller confirm the write
+// took effect without paying to echo the entire card back.
+const UpdateFlashcardResponseSchema = z
+  .object({
+    id: z.string().describe("ID of the updated card"),
+    content: z
+      .string()
+      .optional()
+      .nullable()
+      .describe("Stored content — present only when content was updated"),
+    "deck-id": z
+      .string()
+      .optional()
+      .describe("Current deck — present only when deckId was updated"),
+    "template-id": z
+      .string()
+      .nullable()
+      .optional()
+      .describe("Current template — present only when templateId was updated"),
+    fields: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .nullable()
+      .describe("Stored fields — present only when fields were updated"),
+    trashed: z
+      .boolean()
+      .optional()
+      .describe(
+        "Current trashed state — present only when trashed was updated (true if the card is now trashed)"
+      ),
+  })
+  .strip();
+
+/**
+ * Project an updated card down to just the fields the caller changed. Each
+ * value comes from Mochi's post-update response (the source of truth), so the
+ * result confirms the write landed rather than echoing the request back.
+ */
+export function pickChangedFields(
+  updateArgs: Omit<BatchUpdateItem, "cardId">,
+  card: CreateCardResponse
+): z.infer<typeof UpdateFlashcardResponseSchema> {
+  const changed: z.infer<typeof UpdateFlashcardResponseSchema> = { id: card.id };
+  if (updateArgs.content !== undefined) changed.content = card.content;
+  if (updateArgs.deckId !== undefined) changed["deck-id"] = card["deck-id"];
+  if (updateArgs.templateId !== undefined)
+    changed["template-id"] = card["template-id"] ?? null;
+  if (updateArgs.fields !== undefined) changed.fields = card.fields;
+  if (updateArgs.trashed !== undefined)
+    changed.trashed = Boolean(card["trashed?"]);
+  return changed;
+}
 
 // Schema for update deck tool (combines deckId with update fields)
 const UpdateDeckToolSchema = z.object({
@@ -1497,6 +1654,34 @@ const UpdateFlashcardsRequestSchema = z.object({
     .min(1)
     .describe(
       "Array of update operations. Each item must include cardId plus the fields to change. Use trashed: true here to soft-delete in bulk."
+    ),
+});
+
+// One shared change applied to many cards. Only the fields that are genuinely
+// uniform across a bulk operation are allowed: move (deckId), re-template
+// (templateId), and soft-delete/restore (trashed). Per-card fields like content
+// are deliberately excluded — sharing identical content across hundreds of
+// cards is almost always a mistake, so use update_flashcards for those.
+const UpdateFlashcardsBulkToolSchema = z.object({
+  cardIds: z
+    .array(z.string().min(1))
+    .min(1)
+    .describe(
+      "IDs of the cards to apply the same change to. Get these from list_flashcards or search_flashcards. Duplicates are collapsed."
+    ),
+  deckId: z
+    .string()
+    .optional()
+    .describe("Move every listed card into this deck."),
+  templateId: z
+    .string()
+    .optional()
+    .describe("Set every listed card to use this template."),
+  trashed: z
+    .boolean()
+    .optional()
+    .describe(
+      "Set true to soft-delete every listed card (move to trash), false to restore them."
     ),
 });
 
@@ -1641,9 +1826,9 @@ server.registerTool(
   {
     title: "Update flashcard on Mochi",
     description:
-      "Update an existing flashcard's content, deck, template, or fields. Use delete_flashcard to delete or archive_flashcard to archive.",
+      "Update an existing flashcard's content, deck, template, or fields. Returns the card id plus only the fields you changed (read back from Mochi) to confirm the write — not the whole card. Use delete_flashcard to delete or archive_flashcard to archive.",
     inputSchema: UpdateFlashcardToolSchema,
-    outputSchema: UpdateCardResponseSchema,
+    outputSchema: UpdateFlashcardResponseSchema,
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -1654,7 +1839,8 @@ server.registerTool(
   async (args: z.infer<typeof UpdateFlashcardToolSchema>) => {
     try {
       const { cardId, ...updateArgs } = args;
-      const response = await getMochi().updateCard(cardId, updateArgs);
+      const card = await getMochi().updateCard(cardId, updateArgs);
+      const response = pickChangedFields(updateArgs, card);
       return {
         content: [{ type: "text", text: JSON.stringify(response) }],
         structuredContent: response,
@@ -1737,7 +1923,7 @@ server.registerTool(
   {
     title: "Update flashcards on Mochi (batch)",
     description:
-      "Update one or more flashcards in a single call. Pass an array even for one card. Use trashed: true to soft-delete in bulk, or set deckId to move cards between decks. Returns per-card results; partial success is supported.",
+      "Update one or more flashcards, each with its own change (e.g. unique content per card). Pass an array even for one card. When the SAME change applies to every card (move/trash/re-template), prefer update_flashcards_bulk — it sends the change once instead of repeating it per card. Returns a success count plus itemized failures; partial success is supported.",
     inputSchema: UpdateFlashcardsRequestSchema,
     outputSchema: BatchMutationResultSchema,
     annotations: {
@@ -1761,11 +1947,40 @@ server.registerTool(
 );
 
 server.registerTool(
+  "update_flashcards_bulk",
+  {
+    title: "Bulk-update flashcards on Mochi (one change, many cards)",
+    description:
+      "Apply ONE identical change to many cards at once: move them to a deck (deckId), re-template them (templateId), or soft-delete/restore them (trashed). Send the change once plus a list of cardIds — far cheaper than update_flashcards when the change is uniform. For different changes per card, use update_flashcards instead. Returns a success count plus itemized failures.",
+    inputSchema: UpdateFlashcardsBulkToolSchema,
+    outputSchema: BatchMutationResultSchema,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+  async (args: z.infer<typeof UpdateFlashcardsBulkToolSchema>) => {
+    try {
+      const { cardIds, ...patch } = args;
+      const result = await getMochi().updateCardsBulk(cardIds, patch);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        structuredContent: result,
+      };
+    } catch (error) {
+      return formatToolError(error);
+    }
+  }
+);
+
+server.registerTool(
   "archive_flashcards",
   {
     title: "Archive flashcards on Mochi (batch)",
     description:
-      "Archive or unarchive one or more flashcards in a single call. Pass an array even for one card. Returns per-card results; partial success is supported.",
+      "Archive or unarchive one or more flashcards in a single call. Pass an array even for one card. Returns a success count plus itemized failures; partial success is supported.",
     inputSchema: ArchiveFlashcardsRequestSchema,
     outputSchema: BatchMutationResultSchema,
     annotations: {
@@ -1793,7 +2008,7 @@ server.registerTool(
   {
     title: "Delete flashcards on Mochi (batch)",
     description:
-      "Permanently delete one or more flashcards. WARNING: cannot be undone. For soft delete, use update_flashcards with trashed: true. Returns per-card results; partial success is supported.",
+      "Permanently delete one or more flashcards. WARNING: cannot be undone. For soft delete, use update_flashcards with trashed: true. Returns a success count plus itemized failures; partial success is supported.",
     inputSchema: DeleteFlashcardsRequestSchema,
     outputSchema: BatchMutationResultSchema,
     annotations: {
@@ -1821,7 +2036,7 @@ server.registerTool(
   {
     title: "List flashcards on Mochi",
     description:
-      "List flashcards, optionally filtered by deck. Returns the complete set of cards — results are auto-paginated for you, so there are no bookmarks to follow. The result is bounded by a safety cap: check `truncated` in the response (true means the cap was hit and some cards are omitted). Pass deckId alone for cards directly in that deck; add includeSubdecks: true to also pull cards from every nested subdeck.",
+      "List flashcards, optionally filtered by deck. Returns the complete set of cards — results are auto-paginated for you, so there are no bookmarks to follow. The result is bounded by a safety cap: check `truncated` in the response (true means the cap was hit and some cards are omitted). Pass deckId alone for cards directly in that deck; add includeSubdecks: true to also pull cards from every nested subdeck. Any card Mochi returns that fails validation is set aside in `malformed` (with its id) instead of failing the whole call — repair those to make them listable.",
     inputSchema: ListFlashcardsToolSchema.shape,
     outputSchema: ListCardsResponseSchema,
     annotations: {

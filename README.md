@@ -71,11 +71,12 @@ Add the following to your `claude_desktop_config.json`:
 |------|-------------|
 | `mochi_create_flashcard` | Create a new flashcard in Mochi |
 | `mochi_create_card_from_template` | Create a flashcard using a template with field names (auto-maps to IDs) |
-| `mochi_update_flashcard` | Update a flashcard's content, deck, template, or fields. Can also soft-delete with `trashed` property |
+| `mochi_update_flashcard` | Update a flashcard's content, deck, template, or fields. Returns only the changed fields (plus the card id), read back from Mochi to confirm the write. Can also soft-delete with `trashed` property |
+| `mochi_update_flashcards_bulk` | Apply **one** identical change (move via `deckId`, re-template via `templateId`, or soft-delete/restore via `trashed`) to many cards at once. Send the change once plus a list of `cardIds` — far fewer request tokens than per-card updates. Returns a success count + itemized failures |
 | `mochi_delete_flashcard` | Permanently delete a flashcard and its attachments (cannot be undone) |
 | `mochi_archive_flashcard` | Archive or unarchive a flashcard |
 | `mochi_add_attachment` | Add an attachment (image, audio, etc.) to a card using base64 data |
-| `mochi_list_flashcards` | List flashcards, optionally filtered by deck. Pass `includeSubdecks: true` with a `deckId` to also pull cards from every nested subdeck |
+| `mochi_list_flashcards` | List flashcards, optionally filtered by deck. Pass `includeSubdecks: true` with a `deckId` to also pull cards from every nested subdeck. A card that fails validation is set aside in `malformed` (with its id) instead of failing the whole call |
 | `mochi_list_decks` | List decks (each with `parent-id` for hierarchy). Scope to a deck with `deckId`, and add `includeSubdecks: true` to return its full nested subtree |
 | `mochi_create_deck` | Create a deck, optionally nested under a parent via `parentId` |
 | `mochi_update_deck` | Rename a deck, re-home it under a new `parentId` (or `null` for top level), or soft-delete with `trashed` |
