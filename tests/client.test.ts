@@ -10,6 +10,7 @@ import {
   extractSnippet,
   descendantDeckIds,
   pickChangedFields,
+  summarizeArgs,
 } from "../src/index.js";
 
 // ---- Mock axios instance ----------------------------------------------------
@@ -1041,5 +1042,56 @@ describe("updateDeck", () => {
     });
     await client.updateDeck("d1", { trashed: true });
     expect(api.post.mock.calls[0][1]).toEqual({ "trashed?": true });
+  });
+});
+
+// ---- Diagnostics: request arg summary --------------------------------------
+
+describe("summarizeArgs", () => {
+  it("reports body length and per-field string lengths", () => {
+    const s = summarizeArgs({ content: "hello", "deck-id": "abc" });
+    expect(s.bodyLen).toBe(JSON.stringify({ content: "hello", "deck-id": "abc" }).length);
+    expect(s.fieldLens).toEqual({ content: 5, "deck-id": 3 });
+  });
+
+  it("flags non-ASCII / special characters", () => {
+    expect(summarizeArgs({ content: "plain ascii" }).hasSpecialChars).toBe(false);
+    // accents, em dash, smart quotes, emoji
+    expect(summarizeArgs({ content: "Qué — “x”" }).hasSpecialChars).toBe(true);
+    expect(summarizeArgs({ content: "card 🎴" }).hasSpecialChars).toBe(true);
+  });
+
+  it("does not flag tabs/newlines as special", () => {
+    expect(summarizeArgs({ content: "q\n---\na\t" }).hasSpecialChars).toBe(false);
+  });
+
+  it("notes multipart bodies without serializing the buffer", () => {
+    const formData = { getHeaders: () => ({}), append: () => {} };
+    expect(summarizeArgs(formData)).toEqual({ body: "multipart" });
+  });
+
+  it("returns an empty summary for no body", () => {
+    expect(summarizeArgs(undefined)).toEqual({});
+    expect(summarizeArgs(null)).toEqual({});
+  });
+});
+
+// ---- MochiError message serialization --------------------------------------
+
+describe("MochiError message", () => {
+  it("renders nested object error values as JSON, not [object Object]", () => {
+    const err = new MochiError({ "trashed?": "must be a boolean" }, 422);
+    expect(err.message).toBe("must be a boolean");
+
+    const nested = new MochiError(
+      { errors: { content: "required" } } as any,
+      422
+    );
+    expect(nested.message).toBe('{"content":"required"}');
+    expect(nested.message).not.toContain("[object Object]");
+  });
+
+  it("joins string arrays plainly", () => {
+    expect(new MochiError(["a", "b"], 400).message).toBe("a, b");
   });
 });

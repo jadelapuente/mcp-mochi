@@ -23,10 +23,14 @@ export class MochiError extends Error {
   statusCode: number;
 
   constructor(errors: string[] | Record<string, string>, statusCode: number) {
+    // Mochi sometimes nests error values as objects/arrays; join them through
+    // JSON so the message is legible instead of "[object Object]".
+    const flatten = (v: unknown) =>
+      typeof v === "string" ? v : JSON.stringify(v);
     super(
       Array.isArray(errors)
-        ? errors.join(", ")
-        : Object.values(errors).join(", ")
+        ? errors.map(flatten).join(", ")
+        : Object.values(errors).map(flatten).join(", ")
     );
     this.errors = errors;
     this.statusCode = statusCode;
@@ -570,6 +574,77 @@ async function runWithConcurrency<T, R>(
   return results;
 }
 
+/**
+ * Condense a request body into log-safe metadata: field lengths and a flag for
+ * any non-printable-ASCII characters — never the raw content (which can be huge
+ * or sensitive). Without this, a timing log can't tell "slow because the input
+ * was 40k chars / had weird unicode" from "slow because upstream is flaky".
+ * Multipart uploads (attachments) are noted but not serialized.
+ */
+export function summarizeArgs(data: unknown): Record<string, unknown> {
+  if (data == null) return {};
+  if (typeof (data as { getHeaders?: unknown })?.getHeaders === "function") {
+    return { body: "multipart" };
+  }
+  let serialized: string;
+  try {
+    serialized = typeof data === "string" ? data : JSON.stringify(data) ?? "";
+  } catch {
+    return { body: "unserializable" };
+  }
+  const summary: Record<string, unknown> = {
+    bodyLen: serialized.length,
+    // Anything outside printable ASCII (plus tab/newline/CR): unicode, control
+    // chars, smart quotes — prime suspects for an upstream parsing stall.
+    hasSpecialChars: /[^\x20-\x7E\t\n\r]/.test(serialized),
+  };
+  if (typeof data === "object") {
+    const fieldLens: Record<string, number> = {};
+    for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
+      if (typeof v === "string") fieldLens[k] = v.length;
+    }
+    if (Object.keys(fieldLens).length) summary.fieldLens = fieldLens;
+  }
+  return summary;
+}
+
+/**
+ * One structured stderr line per Mochi HTTP call. stderr is safe on a stdio MCP
+ * server (stdout carries the JSON-RPC protocol). On error we log
+ * `response?.data ?? message`, so structured Mochi error bodies AND bare
+ * timeouts ("timeout of 30000ms exceeded") are both legible — not [object Object].
+ */
+function logMochiCall(
+  config:
+    | {
+        method?: string;
+        url?: string;
+        data?: unknown;
+        metadata?: { args?: Record<string, unknown> };
+      }
+    | undefined,
+  status: number | string,
+  durationMs: number,
+  errPayload?: unknown
+): void {
+  // Prefer the summary captured at request time (object body, with field
+  // lengths); fall back to summarizing whatever's on config now.
+  const args = config?.metadata?.args ?? summarizeArgs(config?.data);
+  const line: Record<string, unknown> = {
+    t: new Date().toISOString(),
+    method: (config?.method ?? "?").toUpperCase(),
+    url: config?.url ?? "?",
+    status,
+    ms: durationMs,
+    ...args,
+  };
+  if (errPayload !== undefined) {
+    line.error =
+      typeof errPayload === "string" ? errPayload : JSON.stringify(errPayload);
+  }
+  console.error(`[mochi] ${JSON.stringify(line)}`);
+}
+
 const DeckSchema = z
   .object({
     id: z.string().describe("Unique identifier for the deck"),
@@ -826,27 +901,79 @@ export class MochiClient {
       },
     });
 
-    // Add response interceptor for error handling
+    // Stamp each request with a start time and an arg summary. The summary is
+    // captured here, before axios serializes config.data to a string, so
+    // per-field lengths survive into the log.
+    this.api.interceptors.request.use((config) => {
+      (
+        config as { metadata?: { start: number; args: Record<string, unknown> } }
+      ).metadata = {
+        start: Date.now(),
+        args: summarizeArgs(config.data),
+      };
+      return config;
+    });
+
+    // Log every call (method, url, arg metadata, status, duration) to stderr,
+    // then preserve the existing error-mapping behavior.
     this.api.interceptors.response.use(
-      (response) => response,
+      (response) => {
+        const start = (response.config as { metadata?: { start: number } })
+          .metadata?.start;
+        logMochiCall(
+          response.config,
+          response.status,
+          start ? Date.now() - start : -1
+        );
+        return response;
+      },
       (error) => {
-        if (axios.isAxiosError(error) && error.response) {
-          const { status, data } = error.response;
-          // Mochi API returns errors as arrays or objects
-          if (data && (Array.isArray(data) || typeof data === "object")) {
-            throw new MochiError(data, status);
+        const cfg = (
+          error as {
+            config?: {
+              metadata?: { start: number; args?: Record<string, unknown> };
+              method?: string;
+              url?: string;
+              data?: unknown;
+            };
           }
-          // Fallback for string error messages
-          if (typeof data === "string" && data.length > 0) {
-            throw new MochiError([data], status);
+        ).config;
+        const ms = cfg?.metadata?.start ? Date.now() - cfg.metadata.start : -1;
+        if (axios.isAxiosError(error)) {
+          // err.response?.data ?? err.message — the structured Mochi body when
+          // there is one, otherwise the axios message (covers timeouts).
+          logMochiCall(
+            error.config,
+            error.response?.status ?? error.code ?? "ERR",
+            ms,
+            error.response?.data ?? error.message
+          );
+          if (error.response) {
+            const { status, data } = error.response;
+            // Mochi API returns errors as arrays or objects
+            if (data && (Array.isArray(data) || typeof data === "object")) {
+              throw new MochiError(data, status);
+            }
+            // Fallback for string error messages
+            if (typeof data === "string" && data.length > 0) {
+              throw new MochiError([data], status);
+            }
+            // Generic error with status
+            throw new MochiError(
+              [`Request failed with status ${status}`],
+              status
+            );
           }
-          // Generic error with status
-          throw new MochiError(
-            [`Request failed with status ${status}`],
-            status
+        } else {
+          logMochiCall(
+            cfg,
+            "ERR",
+            ms,
+            error instanceof Error ? error.message : String(error)
           );
         }
-        // Re-throw non-axios errors
+        // Re-throw non-axios errors (and axios errors with no response, e.g.
+        // timeouts / network failures) unchanged.
         throw error;
       }
     );
