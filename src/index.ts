@@ -4,6 +4,7 @@ import axios, { AxiosInstance } from "axios";
 import FormData from "form-data";
 import { fileURLToPath } from "node:url";
 
+import { MochiRequestGate } from "./request-gate.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import dotenv from "dotenv";
@@ -242,6 +243,8 @@ const CreateCardsFromTemplateRequestSchema = z.object({
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB decoded
 const MAX_RESOURCE_PAGES = 50; // Safety cap when paginating resources
 const MAX_AGGREGATE_CARDS = 2000; // Safety cap when auto-paginating a card list (default list_flashcards and subdeck cascade)
+// Mochi allows one in-flight request per account; batch helpers stay serial too.
+const MOCHI_BATCH_CONCURRENCY = 1;
 
 // Internal type for adding attachments (used by addAttachment method)
 interface AddAttachmentRequest {
@@ -877,12 +880,12 @@ type SearchFlashcardsResponse = z.infer<typeof SearchFlashcardsResponseSchema>;
 export class MochiClient {
   private api: AxiosInstance;
   private token: string;
+  private gate: MochiRequestGate | null = null;
 
   /**
    * @param token   Mochi API token
    * @param apiOverride  Inject an AxiosInstance (used by tests). When
-   *                     provided, no interceptor is attached — the caller
-   *                     is expected to control responses directly.
+   *                     provided, no interceptor or request gate is attached.
    */
   constructor(token: string, apiOverride?: AxiosInstance) {
     this.token = token;
@@ -890,6 +893,7 @@ export class MochiClient {
       this.api = apiOverride;
       return;
     }
+    this.gate = new MochiRequestGate(token);
     this.api = axios.create({
       baseURL: "https://app.mochi.cards/api/",
       timeout: 30000,
@@ -950,6 +954,10 @@ export class MochiClient {
           );
           if (error.response) {
             const { status, data } = error.response;
+            // Pass rate-limit errors to the request gate for retry.
+            if (status === 429 || status === 503) {
+              throw error;
+            }
             // Mochi API returns errors as arrays or objects
             if (data && (Array.isArray(data) || typeof data === "object")) {
               throw new MochiError(data, status);
@@ -979,6 +987,11 @@ export class MochiClient {
     );
   }
 
+  /** Route HTTP through the account gate (serial + cross-process lock + retry). */
+  private request<T>(fn: () => Promise<T>): Promise<T> {
+    return this.gate ? this.gate.run(fn) : fn();
+  }
+
   async createCard(request: CreateCardRequest): Promise<CreateCardResponse> {
     // Attachments are handled in createCards()/createCardsFromTemplate(),
     // not here, because they require a second request after the card is
@@ -992,7 +1005,9 @@ export class MochiClient {
       );
     }
     const mochiRequest = toMochiCreateCardRequest(request);
-    const response = await this.api.post("/cards", mochiRequest);
+    const response = await this.request(() =>
+      this.api.post("/cards", mochiRequest)
+    );
     return CreateCardResponseSchema.parse(response.data);
   }
 
@@ -1001,9 +1016,11 @@ export class MochiClient {
     request: UpdateCardRequest
   ): Promise<CreateCardResponse> {
     const mochiRequest = toMochiUpdateCardRequest(request);
-    const response = await this.api.post(
-      `/cards/${encodeURIComponent(cardId)}`,
-      mochiRequest
+    const response = await this.request(() =>
+      this.api.post(
+        `/cards/${encodeURIComponent(cardId)}`,
+        mochiRequest
+      )
     );
     return CreateCardResponseSchema.parse(response.data);
   }
@@ -1012,7 +1029,9 @@ export class MochiClient {
     request: CreateDeckRequest
   ): Promise<z.infer<typeof DeckSchema>> {
     const mochiRequest = toMochiCreateDeckRequest(request);
-    const response = await this.api.post("/decks", mochiRequest);
+    const response = await this.request(() =>
+      this.api.post("/decks", mochiRequest)
+    );
     return DeckSchema.parse(response.data);
   }
 
@@ -1021,9 +1040,11 @@ export class MochiClient {
     request: UpdateDeckRequest
   ): Promise<z.infer<typeof DeckSchema>> {
     const mochiRequest = toMochiUpdateDeckRequest(request);
-    const response = await this.api.post(
-      `/decks/${encodeURIComponent(deckId)}`,
-      mochiRequest
+    const response = await this.request(() =>
+      this.api.post(
+        `/decks/${encodeURIComponent(deckId)}`,
+        mochiRequest
+      )
     );
     return DeckSchema.parse(response.data);
   }
@@ -1048,11 +1069,13 @@ export class MochiClient {
 
     // Default: a single page from Mochi. Only `bookmark` is a real API param;
     // our scoping params must never be forwarded as query string.
-    const response = await this.api.get("/decks", {
-      params: validatedParams?.bookmark
-        ? { bookmark: validatedParams.bookmark }
-        : undefined,
-    });
+    const response = await this.request(() =>
+      this.api.get("/decks", {
+        params: validatedParams?.bookmark
+          ? { bookmark: validatedParams.bookmark }
+          : undefined,
+      })
+    );
     const parsed = ListDecksResponseSchema.parse(response.data);
     return {
       bookmark: parsed.bookmark,
@@ -1151,7 +1174,9 @@ export class MochiClient {
     const mochiParams = validatedParams
       ? toMochiListCardsParams(validatedParams)
       : undefined;
-    const response = await this.api.get("/cards", { params: mochiParams });
+    const response = await this.request(() =>
+      this.api.get("/cards", { params: mochiParams })
+    );
 
     // Validate the envelope, then each card on its own: a single corrupt card
     // is quarantined in `malformed` (with its id) rather than throwing out the
@@ -1291,9 +1316,11 @@ export class MochiClient {
       : undefined;
     // `verbose` is for our slimming logic, not a Mochi query param.
     const { verbose, ...mochiParams } = validatedParams ?? {};
-    const response = await this.api.get("/templates", {
-      params: Object.keys(mochiParams).length ? mochiParams : undefined,
-    });
+    const response = await this.request(() =>
+      this.api.get("/templates", {
+        params: Object.keys(mochiParams).length ? mochiParams : undefined,
+      })
+    );
     const data = response.data;
     if (verbose) {
       return ListTemplatesResponseSchema.parse(data);
@@ -1343,15 +1370,17 @@ export class MochiClient {
     const queryParams = validatedParams?.date
       ? { date: validatedParams.date }
       : undefined;
-    const response = await this.api.get(endpoint, { params: queryParams });
+    const response = await this.request(() =>
+      this.api.get(endpoint, { params: queryParams })
+    );
     return GetDueCardsResponseSchema.parse(response.data);
   }
 
   async getTemplate(
     templateId: string
   ): Promise<z.infer<typeof TemplateSchema>> {
-    const response = await this.api.get(
-      `/templates/${encodeURIComponent(templateId)}`
+    const response = await this.request(() =>
+      this.api.get(`/templates/${encodeURIComponent(templateId)}`)
     );
     return TemplateSchema.parse(response.data);
   }
@@ -1414,16 +1443,20 @@ export class MochiClient {
       fields,
     };
 
-    const response = await this.api.post("/cards", mochiRequest);
+    const response = await this.request(() =>
+      this.api.post("/cards", mochiRequest)
+    );
     return CreateCardResponseSchema.parse(response.data);
   }
 
   async deleteCard(cardId: string): Promise<void> {
-    await this.api.delete(`/cards/${encodeURIComponent(cardId)}`);
+    await this.request(() =>
+      this.api.delete(`/cards/${encodeURIComponent(cardId)}`)
+    );
   }
 
   async createCards(requests: CreateCardRequest[]): Promise<BatchCreateResult> {
-    const settled = await runWithConcurrency(requests, 3, async (req) => {
+    const settled = await runWithConcurrency(requests, MOCHI_BATCH_CONCURRENCY, async (req) => {
       // Strip attachments before createCard — the singular path refuses
       // them by design (it can't upload). The batch wrapper uploads
       // attachments itself after the card is created.
@@ -1452,7 +1485,7 @@ export class MochiClient {
       })
     );
 
-    const settled = await runWithConcurrency(requests, 3, async (req) => {
+    const settled = await runWithConcurrency(requests, MOCHI_BATCH_CONCURRENCY, async (req) => {
       const card = await this.createCardFromTemplate(
         req,
         templateCache.get(req.templateId)
@@ -1537,19 +1570,21 @@ export class MochiClient {
     });
 
     // Upload attachment
-    await this.api.post(
-      `/cards/${encodeURIComponent(
-        request.cardId
-      )}/attachments/${encodeURIComponent(request.filename)}`,
-      formData,
-      {
-        headers: {
-          ...formData.getHeaders(),
-          Authorization: `Basic ${Buffer.from(`${this.token}:`).toString(
-            "base64"
-          )}`,
-        },
-      }
+    await this.request(() =>
+      this.api.post(
+        `/cards/${encodeURIComponent(
+          request.cardId
+        )}/attachments/${encodeURIComponent(request.filename)}`,
+        formData,
+        {
+          headers: {
+            ...formData.getHeaders(),
+            Authorization: `Basic ${Buffer.from(`${this.token}:`).toString(
+              "base64"
+            )}`,
+          },
+        }
+      )
     );
 
     return {
@@ -1561,7 +1596,7 @@ export class MochiClient {
   async updateCards(
     items: BatchUpdateItem[]
   ): Promise<BatchMutationResult> {
-    const settled = await runWithConcurrency(items, 3, async (item) => {
+    const settled = await runWithConcurrency(items, MOCHI_BATCH_CONCURRENCY, async (item) => {
       const { cardId, ...rest } = item;
       await this.updateCard(cardId, rest);
       return cardId;
@@ -1597,7 +1632,7 @@ export class MochiClient {
   async archiveCards(
     items: BatchArchiveItem[]
   ): Promise<BatchMutationResult> {
-    const settled = await runWithConcurrency(items, 3, async (item) => {
+    const settled = await runWithConcurrency(items, MOCHI_BATCH_CONCURRENCY, async (item) => {
       await this.updateCard(item.cardId, { archived: item.archived });
       return item.cardId;
     });
@@ -1607,7 +1642,7 @@ export class MochiClient {
   async deleteCards(
     items: BatchDeleteItem[]
   ): Promise<BatchMutationResult> {
-    const settled = await runWithConcurrency(items, 3, async (item) => {
+    const settled = await runWithConcurrency(items, MOCHI_BATCH_CONCURRENCY, async (item) => {
       await this.deleteCard(item.cardId);
       return item.cardId;
     });

@@ -65,6 +65,18 @@ Add the following to your `claude_desktop_config.json`:
    MOCHI_API_KEY=<YOUR_TOKEN> npx @modelcontextprotocol/inspector node dist/index.js
    ```
 
+## Rate limits and multi-agent use
+
+The [Mochi API](https://mochi.cards/docs/api/) allows **one in-flight request per account**. This server enforces that in three layers:
+
+1. **In-process queue** — all HTTP calls in a single MCP process are serialized.
+2. **File lock** — multiple MCP processes on the **same machine** sharing one `MOCHI_API_KEY` coordinate via a lock file under `~/.cache/mcp-mochi/locks/` (or `$XDG_CACHE_HOME`). Different API keys do not block each other.
+3. **429 retry** — if a rate limit still occurs (e.g. the Mochi desktop app is using the API at the same time), requests are retried with backoff.
+
+Set `MOCHI_DISABLE_ACCOUNT_LOCK=1` to skip the cross-process file lock (useful for tests or debugging). The in-process queue always applies when using a real API client.
+
+Large batch operations (create/update many cards) run **serially** — correct, but slower than parallel would be.
+
 ## Available Tools
 
 | Tool | Description |

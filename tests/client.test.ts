@@ -435,6 +435,33 @@ describe("addAttachment size cap", () => {
   });
 });
 
+// ---- Batch create runs serially (Mochi: 1 in-flight / account) --------------
+
+describe("createCards serial HTTP", () => {
+  it("issues card POSTs one at a time, never overlapping", async () => {
+    const inFlight: number[] = [];
+    let peak = 0;
+    const { client } = newClient({
+      post: async (url) => {
+        if (url !== "/cards") return { data: sampleCard() };
+        inFlight.push(1);
+        peak = Math.max(peak, inFlight.length);
+        await new Promise((r) => setTimeout(r, 10));
+        inFlight.pop();
+        return { data: sampleCard({ id: `c-${Math.random()}` }) };
+      },
+    });
+
+    await client.createCards([
+      { content: "a\n---\nb", deckId: "d", templateId: null },
+      { content: "c\n---\nd", deckId: "d", templateId: null },
+      { content: "e\n---\nf", deckId: "d", templateId: null },
+    ]);
+
+    expect(peak).toBe(1);
+  });
+});
+
 // ---- Direct createCard refuses attachments ---------------------------------
 
 describe("createCard direct attachment guard", () => {
