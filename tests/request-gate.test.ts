@@ -1,10 +1,15 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { AxiosError } from "axios";
+import { createHash } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import {
   SerialQueue,
   MochiRequestGate,
   NoOpAccountLock,
+  FileAccountLock,
   isRetryableRateLimit,
   backoffMs,
 } from "../src/request-gate.js";
@@ -127,5 +132,30 @@ describe("NoOpAccountLock", () => {
     const lock = new NoOpAccountLock();
     await lock.acquire();
     await lock.release();
+  });
+});
+
+describe("FileAccountLock", () => {
+  it("gives up with a clear error instead of waiting forever for another process's lock", async () => {
+    // Two chats on the same Mochi account each spawn their own mcp-mochi
+    // process, so this is the real contention scenario: same key, two
+    // FileAccountLock instances racing for the same on-disk lock.
+    const apiKey = `test-account-${Date.now()}`;
+    const holder = new FileAccountLock(apiKey);
+    const contender = new FileAccountLock(apiKey, { maxWaitMs: 300 });
+
+    await holder.acquire();
+    try {
+      const start = Date.now();
+      await expect(contender.acquire()).rejects.toThrow(/timed out/i);
+      expect(Date.now() - start).toBeLessThan(2000);
+    } finally {
+      await holder.release();
+      // FileAccountLock keys its lock file off a real cache dir (there's no
+      // injectable path), so clean up the file this test created for it.
+      const hash = createHash("sha256").update(apiKey).digest("hex");
+      const cacheBase = process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache");
+      await rm(join(cacheBase, "mcp-mochi", "locks", hash), { force: true });
+    }
   });
 });
