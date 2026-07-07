@@ -30,16 +30,24 @@ export class NoOpAccountLock implements AccountLock {
   async release(): Promise<void> {}
 }
 
+// Every chat/session spawns its own mcp-mochi process, so this lock routinely
+// contends across processes (not just within one). Cap the wait instead of
+// retrying forever: if another process is genuinely stuck mid-request, every
+// other chat should get a clear error rather than hang indefinitely.
+const DEFAULT_LOCK_MAX_WAIT_MS = 60_000;
+
 /** Cross-process advisory lock keyed by API key hash (same host). */
 export class FileAccountLock implements AccountLock {
   private readonly lockTarget: string;
+  private readonly maxWaitMs: number;
   private releaseFn: (() => Promise<void>) | null = null;
 
-  constructor(apiKey: string) {
+  constructor(apiKey: string, options?: { maxWaitMs?: number }) {
     const hash = createHash("sha256").update(apiKey).digest("hex");
     const cacheBase =
       process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache");
     this.lockTarget = join(cacheBase, "mcp-mochi", "locks", hash);
+    this.maxWaitMs = options?.maxWaitMs ?? DEFAULT_LOCK_MAX_WAIT_MS;
   }
 
   async acquire(): Promise<void> {
@@ -47,13 +55,22 @@ export class FileAccountLock implements AccountLock {
     await mkdir(dir, { recursive: true });
     // proper-lockfile requires the target path to exist.
     await writeFile(this.lockTarget, "", { flag: "a" });
-    this.releaseFn = await lockfile.lock(this.lockTarget, {
-      retries: {
-        forever: true,
-        minTimeout: 50,
-        maxTimeout: 2000,
-      },
-    });
+    try {
+      this.releaseFn = await lockfile.lock(this.lockTarget, {
+        retries: {
+          forever: true,
+          minTimeout: 50,
+          maxTimeout: 2000,
+          maxRetryTime: this.maxWaitMs,
+        },
+      });
+    } catch {
+      throw new Error(
+        `Timed out after ${Math.round(this.maxWaitMs / 1000)}s waiting for the Mochi account lock (${
+          this.lockTarget
+        }). Another mcp-mochi process — e.g. a different open chat — is likely mid-request. Wait for it to finish, or if none is actually running, delete that lock file and retry.`
+      );
+    }
   }
 
   async release(): Promise<void> {
