@@ -6,7 +6,7 @@ MCP server for [Mochi](https://mochi.cards) flashcard integration, allowing you 
 
 - Create, update, and delete flashcards
 - Create cards from templates with automatic field name-to-ID mapping
-- Add attachments (images, audio) to cards
+- Add attachments (images, audio) while creating cards
 - Get cards due for review
 - List flashcards, decks, and templates
 
@@ -71,7 +71,9 @@ The [Mochi API](https://mochi.cards/docs/api/) allows **one in-flight request pe
 
 1. **In-process queue** — all HTTP calls in a single MCP process are serialized.
 2. **File lock** — multiple MCP processes on the **same machine** sharing one `MOCHI_API_KEY` coordinate via a lock file under `~/.cache/mcp-mochi/locks/` (or `$XDG_CACHE_HOME`). Different API keys do not block each other.
-3. **429 retry** — if a rate limit still occurs (e.g. the Mochi desktop app is using the API at the same time), requests are retried with backoff.
+3. **Retry with backoff** — rate limits (`429`) and service unavailability (`503`) are retried for all requests. Read-only requests also retry transient transport/server failures such as `408`, `425`, `500`, `502`, `504`, connection resets, timeouts, and temporary DNS failures. Retry-After headers are honored when Mochi sends them.
+
+Mutating requests do **not** broadly retry ambiguous network failures. For example, if card creation times out after Mochi already created the card, retrying could create a duplicate.
 
 Set `MOCHI_DISABLE_ACCOUNT_LOCK=1` to skip the cross-process file lock (useful for tests or debugging). The in-process queue always applies when using a real API client.
 
