@@ -1,8 +1,7 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { AxiosError } from "axios";
-import { createHash } from "node:crypto";
-import { rm } from "node:fs/promises";
-import { homedir } from "node:os";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -11,7 +10,9 @@ import {
   NoOpAccountLock,
   FileAccountLock,
   isRetryableRateLimit,
+  isRetryableTransientError,
   backoffMs,
+  retryAfterMs,
 } from "../src/request-gate.js";
 
 function axios429(): AxiosError {
@@ -28,6 +29,26 @@ function axios429(): AxiosError {
       config: {} as never,
     }
   );
+}
+
+function axiosStatus(status: number, headers: Record<string, string> = {}): AxiosError {
+  return new AxiosError(
+    `HTTP ${status}`,
+    String(status),
+    undefined,
+    undefined,
+    {
+      status,
+      statusText: `HTTP ${status}`,
+      headers,
+      data: {},
+      config: {} as never,
+    }
+  );
+}
+
+function axiosNetwork(code: string): AxiosError {
+  return new AxiosError("network failure", code);
 }
 
 describe("SerialQueue", () => {
@@ -82,6 +103,33 @@ describe("isRetryableRateLimit", () => {
   });
 });
 
+describe("isRetryableTransientError", () => {
+  it("returns true for retryable server and network failures", () => {
+    expect(isRetryableTransientError(axiosStatus(502))).toBe(true);
+    expect(isRetryableTransientError(axiosStatus(504))).toBe(true);
+    expect(isRetryableTransientError(axiosNetwork("ECONNRESET"))).toBe(true);
+    expect(isRetryableTransientError(axiosNetwork("EAI_AGAIN"))).toBe(true);
+  });
+
+  it("returns false for validation/client errors and non-axios errors", () => {
+    expect(isRetryableTransientError(axiosStatus(400))).toBe(false);
+    expect(isRetryableTransientError(axiosStatus(404))).toBe(false);
+    expect(isRetryableTransientError(new Error("nope"))).toBe(false);
+  });
+});
+
+describe("retryAfterMs", () => {
+  it("parses numeric Retry-After seconds", () => {
+    expect(retryAfterMs(axiosStatus(429, { "retry-after": "2" }))).toBe(2000);
+    expect(retryAfterMs(axiosStatus(429, { "Retry-After": "3" }))).toBe(3000);
+  });
+
+  it("returns null when Retry-After is absent or invalid", () => {
+    expect(retryAfterMs(axiosStatus(429))).toBeNull();
+    expect(retryAfterMs(axiosStatus(429, { "retry-after": "later" }))).toBeNull();
+  });
+});
+
 describe("backoffMs", () => {
   it("grows with attempt and stays capped", () => {
     expect(backoffMs(0)).toBeGreaterThanOrEqual(200);
@@ -90,10 +138,6 @@ describe("backoffMs", () => {
 });
 
 describe("MochiRequestGate retry", () => {
-  beforeEach(() => {
-    vi.spyOn(console, "error").mockImplementation(() => {});
-  });
-
   afterEach(() => {
     vi.restoreAllMocks();
   });
@@ -101,6 +145,9 @@ describe("MochiRequestGate retry", () => {
   it("retries on 429 and eventually succeeds", async () => {
     const gate = new MochiRequestGate("test-key", {
       disableAccountLock: true,
+      sleep: async () => {},
+      backoffMs: () => 0,
+      logger: () => {},
     });
     let calls = 0;
 
@@ -117,6 +164,9 @@ describe("MochiRequestGate retry", () => {
   it("throws after max retry attempts on persistent 429", async () => {
     const gate = new MochiRequestGate("test-key", {
       disableAccountLock: true,
+      sleep: async () => {},
+      backoffMs: () => 0,
+      logger: () => {},
     });
 
     await expect(
@@ -124,6 +174,79 @@ describe("MochiRequestGate retry", () => {
         throw axios429();
       })
     ).rejects.toThrow("Too Many Requests");
+  });
+
+  it("retries transient failures only when the caller opts in", async () => {
+    const noRetryGate = new MochiRequestGate("test-key", {
+      disableAccountLock: true,
+      sleep: async () => {},
+      backoffMs: () => 0,
+      logger: () => {},
+    });
+    let noRetryCalls = 0;
+    await expect(
+      noRetryGate.run(async () => {
+        noRetryCalls++;
+        throw axiosStatus(502);
+      })
+    ).rejects.toThrow("HTTP 502");
+    expect(noRetryCalls).toBe(1);
+
+    const retryGate = new MochiRequestGate("test-key", {
+      disableAccountLock: true,
+      sleep: async () => {},
+      backoffMs: () => 0,
+      logger: () => {},
+    });
+    let retryCalls = 0;
+    const result = await retryGate.run(
+      async () => {
+        retryCalls++;
+        if (retryCalls === 1) throw axiosStatus(502);
+        return "ok";
+      },
+      { retryTransientErrors: true }
+    );
+    expect(result).toBe("ok");
+    expect(retryCalls).toBe(2);
+  });
+
+  it("releases the account lock before sleeping between retry attempts", async () => {
+    const events: string[] = [];
+    const gate = new MochiRequestGate("test-key", {
+      lock: {
+        async acquire() {
+          events.push("acquire");
+        },
+        async release() {
+          events.push("release");
+        },
+      },
+      sleep: async (ms) => {
+        events.push(`sleep:${ms}`);
+      },
+      backoffMs: () => 123,
+      logger: () => {},
+    });
+    let calls = 0;
+
+    const result = await gate.run(async () => {
+      calls++;
+      events.push(`call:${calls}`);
+      if (calls === 1) throw axios429();
+      return "ok";
+    });
+
+    expect(result).toBe("ok");
+    expect(events).toEqual([
+      "acquire",
+      "call:1",
+      "release",
+      "sleep:123",
+      "acquire",
+      "call:2",
+      "release",
+    ]);
   });
 });
 
@@ -141,8 +264,9 @@ describe("FileAccountLock", () => {
     // process, so this is the real contention scenario: same key, two
     // FileAccountLock instances racing for the same on-disk lock.
     const apiKey = `test-account-${Date.now()}`;
-    const holder = new FileAccountLock(apiKey);
-    const contender = new FileAccountLock(apiKey, { maxWaitMs: 300 });
+    const cacheBase = await mkdtemp(join(tmpdir(), "mcp-mochi-test-"));
+    const holder = new FileAccountLock(apiKey, { cacheBase });
+    const contender = new FileAccountLock(apiKey, { cacheBase, maxWaitMs: 300 });
 
     await holder.acquire();
     try {
@@ -151,11 +275,7 @@ describe("FileAccountLock", () => {
       expect(Date.now() - start).toBeLessThan(2000);
     } finally {
       await holder.release();
-      // FileAccountLock keys its lock file off a real cache dir (there's no
-      // injectable path), so clean up the file this test created for it.
-      const hash = createHash("sha256").update(apiKey).digest("hex");
-      const cacheBase = process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache");
-      await rm(join(cacheBase, "mcp-mochi", "locks", hash), { force: true });
+      await rm(cacheBase, { force: true, recursive: true });
     }
   });
 });

@@ -42,10 +42,10 @@ export class FileAccountLock implements AccountLock {
   private readonly maxWaitMs: number;
   private releaseFn: (() => Promise<void>) | null = null;
 
-  constructor(apiKey: string, options?: { maxWaitMs?: number }) {
+  constructor(apiKey: string, options?: { maxWaitMs?: number; cacheBase?: string }) {
     const hash = createHash("sha256").update(apiKey).digest("hex");
     const cacheBase =
-      process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache");
+      options?.cacheBase ?? process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache");
     this.lockTarget = join(cacheBase, "mcp-mochi", "locks", hash);
     this.maxWaitMs = options?.maxWaitMs ?? DEFAULT_LOCK_MAX_WAIT_MS;
   }
@@ -84,6 +84,15 @@ export class FileAccountLock implements AccountLock {
 const MAX_RETRY_ATTEMPTS = 5;
 const RETRY_BASE_MS = 200;
 const RETRY_MAX_MS = 5000;
+const RETRY_AFTER_MAX_MS = 60_000;
+
+export interface MochiRequestGateRunOptions {
+  /**
+   * Retry transport/server failures where a repeat request is safe for the
+   * caller. Use this for read-only/idempotent requests, not card creation.
+   */
+  retryTransientErrors?: boolean;
+}
 
 export function isRetryableRateLimit(error: unknown): boolean {
   if (axios.isAxiosError(error)) {
@@ -93,14 +102,59 @@ export function isRetryableRateLimit(error: unknown): boolean {
   return false;
 }
 
+export function isRetryableTransientError(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  const status = error.response?.status;
+  if (status !== undefined) {
+    return [408, 425, 429, 500, 502, 503, 504].includes(status);
+  }
+  return [
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "ECONNABORTED",
+    "EAI_AGAIN",
+    "ERR_NETWORK",
+  ].includes(error.code ?? "");
+}
+
+export function retryAfterMs(error: unknown): number | null {
+  if (!axios.isAxiosError(error)) return null;
+  const headers = error.response?.headers as
+    | ({ get?: (name: string) => unknown } & Record<string, unknown>)
+    | undefined;
+  const raw =
+    headers?.get?.("retry-after") ??
+    headers?.["retry-after"] ??
+    headers?.["Retry-After"];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== "string" && typeof value !== "number") return null;
+
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return Math.min(seconds * 1000, RETRY_AFTER_MAX_MS);
+  }
+
+  const dateMs = Date.parse(String(value));
+  if (!Number.isFinite(dateMs)) return null;
+  return Math.min(Math.max(0, dateMs - Date.now()), RETRY_AFTER_MAX_MS);
+}
+
 export function backoffMs(attempt: number): number {
   const exp = Math.min(RETRY_BASE_MS * 2 ** attempt, RETRY_MAX_MS);
   const jitter = Math.random() * exp * 0.25;
   return exp + jitter;
 }
 
-const sleep = (ms: number) =>
+const defaultSleep = (ms: number) =>
   new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export interface MochiRequestGateOptions {
+  disableAccountLock?: boolean;
+  lock?: AccountLock;
+  sleep?: (ms: number) => Promise<void>;
+  backoffMs?: (attempt: number) => number;
+  logger?: (message: string) => void;
+}
 
 /**
  * One in-flight Mochi HTTP request per account: in-process queue, optional
@@ -109,42 +163,68 @@ const sleep = (ms: number) =>
 export class MochiRequestGate {
   private readonly queue = new SerialQueue();
   private readonly lock: AccountLock;
+  private readonly sleep: (ms: number) => Promise<void>;
+  private readonly getBackoffMs: (attempt: number) => number;
+  private readonly logger: (message: string) => void;
 
-  constructor(apiKey: string, options?: { disableAccountLock?: boolean }) {
+  constructor(apiKey: string, options?: MochiRequestGateOptions) {
     const disabled =
       options?.disableAccountLock ||
       process.env.MOCHI_DISABLE_ACCOUNT_LOCK === "1";
-    this.lock = disabled ? new NoOpAccountLock() : new FileAccountLock(apiKey);
+    this.lock =
+      options?.lock ?? (disabled ? new NoOpAccountLock() : new FileAccountLock(apiKey));
+    this.sleep = options?.sleep ?? defaultSleep;
+    this.getBackoffMs = options?.backoffMs ?? backoffMs;
+    this.logger = options?.logger ?? console.error;
   }
 
-  run<T>(fn: () => Promise<T>): Promise<T> {
-    return this.queue.run(() => this.runWithLockAndRetry(fn));
+  run<T>(
+    fn: () => Promise<T>,
+    options: MochiRequestGateRunOptions = {}
+  ): Promise<T> {
+    return this.queue.run(() => this.runWithLockAndRetry(fn, options));
   }
 
-  private async runWithLockAndRetry<T>(fn: () => Promise<T>): Promise<T> {
+  private async runWithLockAndRetry<T>(
+    fn: () => Promise<T>,
+    options: MochiRequestGateRunOptions
+  ): Promise<T> {
     let lastError: unknown;
     for (let attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt++) {
       await this.lock.acquire();
+      let retryDelayMs: number | null = null;
       try {
         return await fn();
       } catch (error) {
         lastError = error;
-        if (isRetryableRateLimit(error) && attempt < MAX_RETRY_ATTEMPTS - 1) {
-          console.error(
+        const retryable =
+          isRetryableRateLimit(error) ||
+          (options.retryTransientErrors && isRetryableTransientError(error));
+        if (retryable && attempt < MAX_RETRY_ATTEMPTS - 1) {
+          retryDelayMs = retryAfterMs(error) ?? this.getBackoffMs(attempt);
+          const retryCause = axios.isAxiosError(error)
+            ? {
+                status: error.response?.status,
+                code: error.code,
+              }
+            : {};
+          this.logger(
             `[mochi] ${JSON.stringify({
               t: new Date().toISOString(),
-              event: "rate_limit_retry",
+              event: "request_retry",
               attempt: attempt + 1,
               maxAttempts: MAX_RETRY_ATTEMPTS,
+              delayMs: Math.round(retryDelayMs),
+              ...retryCause,
             })}`
           );
-          await sleep(backoffMs(attempt));
-          continue;
+        } else {
+          throw error;
         }
-        throw error;
       } finally {
         await this.lock.release();
       }
+      await this.sleep(retryDelayMs);
     }
     throw lastError;
   }

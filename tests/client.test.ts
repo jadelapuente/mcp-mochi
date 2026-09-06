@@ -1,17 +1,16 @@
 import { describe, it, expect, vi } from "vitest";
 import type { AxiosInstance } from "axios";
 
+import { descendantDeckIds } from "../src/deck-tree.js";
+import { summarizeArgs } from "../src/diagnostics.js";
+import { MochiError } from "../src/errors.js";
+import { MochiClient, pickChangedFields } from "../src/mochi-client.js";
 import {
-  MochiClient,
-  MochiError,
+  extractSnippet,
+  jaccard,
   normalizeForSearch,
   trigrams,
-  jaccard,
-  extractSnippet,
-  descendantDeckIds,
-  pickChangedFields,
-  summarizeArgs,
-} from "../src/index.js";
+} from "../src/search.js";
 
 // ---- Mock axios instance ----------------------------------------------------
 
@@ -51,6 +50,23 @@ function mockApi(handlers: {
 function newClient(handlers: Parameters<typeof mockApi>[0] = {}) {
   const api = mockApi(handlers);
   return { client: new MochiClient("test-token", api.api), api };
+}
+
+function newClientWithGate(handlers: Parameters<typeof mockApi>[0] = {}) {
+  const api = mockApi(handlers);
+  const gateRuns: unknown[] = [];
+  const gate = {
+    run: vi.fn(async <T>(fn: () => Promise<T>, options?: unknown) => {
+      gateRuns.push(options);
+      return fn();
+    }),
+  };
+  return {
+    client: new MochiClient("test-token", api.api, { gate }),
+    api,
+    gate,
+    gateRuns,
+  };
 }
 
 const sampleCard = (overrides: Record<string, unknown> = {}) => ({
@@ -407,6 +423,28 @@ describe("URL encoding of path params", () => {
     expect(api.post.mock.calls[0][0]).toBe(
       "/cards/card%2F1/attachments/hello%20world.png"
     );
+  });
+});
+
+describe("MochiClient request retry policy", () => {
+  it("opts read requests into transient retries", async () => {
+    const { client, gateRuns } = newClientWithGate({
+      get: () => ({ data: { bookmark: "", docs: [] } }),
+    });
+
+    await client.listDecks();
+
+    expect(gateRuns).toEqual([{ retryTransientErrors: true }]);
+  });
+
+  it("leaves mutating requests on the default gate policy", async () => {
+    const { client, gateRuns } = newClientWithGate({
+      post: () => ({ data: sampleCard() }),
+    });
+
+    await client.createCard({ content: "q\n---\na", deckId: "d" });
+
+    expect(gateRuns).toEqual([undefined]);
   });
 });
 
